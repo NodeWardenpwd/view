@@ -767,3 +767,29 @@ async fn canvas_delete(
         Err(_) => StatusCode::NOT_FOUND,
     }
 }
+
+
+use axum::{extract::Query, response::Json, serde::Deserialize};
+use std::env;
+
+#[derive(Deserialize)]
+struct VerifyParams {
+    email: String,
+}
+
+#[derive(serde::Serialize)]
+struct VerifyResponse {
+    allowed: bool,
+}
+
+// 专门用来验证 Google 邮箱白名单的接口
+async fn verify_email(Query(params): Query<VerifyParams>) -> Json<VerifyResponse> {
+    // 从 Hugging Face 的 Secrets 中读取配置的环境变量
+    // 如果没有配置，为了安全，默认不允许任何人登录
+    let allowed_email = env::var("ALLOWED_EMAIL").unwrap_or_else(|_| "".to_string());
+    
+    // 比较前端传过来的邮箱和环境变量是否一致
+    let is_allowed = !allowed_email.is_empty() && params.email.trim().to_lowercase() == allowed_email.trim().to_lowercase();
+    
+    Json(VerifyResponse { allowed: is_allowed })
+}
