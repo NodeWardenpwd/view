@@ -2706,36 +2706,26 @@
         window.addEventListener('DOMContentLoaded', initApp);
 		
 		// ==========================================
-        // 🔒 【前后端双重铁闸】UDF 路径自动去重与安全追踪补丁
+        // 🔒 【前后端双重铁闸】UDF 路径归位与安全追踪补丁
         // ==========================================
         (function() {
             // 1. 动态获取当前本地成功通过验证的邮箱
             const userEmail = localStorage.getItem('logged_in_email') || '';
 
-            // 2. 强力拦截、纠正并去重浏览器的 fetch 请求
+            // 2. 拦截并给 TradingView 的核心请求挂上邮箱参数
             const originalFetch = window.fetch;
             window.fetch = function(url, options = {}) {
                 if (typeof url === 'string') {
-                    // 检查是否是图表库发出的核心 UDF 接口
+                    // 检查是否是图表库发出的 UDF 接口
                     if (url.includes('config') || url.includes('symbols') || url.includes('history') || url.includes('search')) {
                         
                         let targetUrl = url;
-                        // 【路径防走偏与去重核心修复】：如果是异常路径，直接掰正
-                        if (targetUrl.startsWith('config') || targetUrl.startsWith('/config')) {
-                            targetUrl = '/api/config';
-                        } else if (!targetUrl.startsWith('/api') && !targetUrl.startsWith('http')) {
-                            targetUrl = '/api/' + targetUrl.replace(/^\//, '');
-                        }
-
-                        // 【核心补丁：双斜杠彻底去重】把所有诸如 api//config 替换为 api/config
-                        targetUrl = targetUrl.replace(/\/+/g, '/');
-                        // 如果不小心把 https:// 里的双斜杠也连坐了，给它修复回来（如果是相对路径则不影响）
-                        if (targetUrl.startsWith('http:/') && !targetUrl.startsWith('http://')) {
-                            targetUrl = targetUrl.replace('http:/', 'http://');
-                        }
-                        if (targetUrl.startsWith('https:/') && !targetUrl.startsWith('https://')) {
-                            targetUrl = targetUrl.replace('https:/', 'https://');
-                        }
+                        
+                        // 【终极修复】：如果路径因为相对路径走偏成了 config，我们把它规范化为标准相对本站路径 /config
+                        if (targetUrl.startsWith('config')) targetUrl = '/config';
+                        if (targetUrl.startsWith('symbols')) targetUrl = '/symbols';
+                        if (targetUrl.startsWith('history')) targetUrl = '/history';
+                        if (targetUrl.startsWith('search')) targetUrl = '/search';
 
                         // 动态拼装 user_email 参数
                         const separator = targetUrl.includes('?') ? '&' : '?';
@@ -2746,7 +2736,7 @@
                 }
                 return originalFetch(url, options);
             };
-            console.log("【安全卫士】双斜杠自动去重铁闸已就位！");
+            console.log("【安全卫士】标准归位铁闸已就位！");
         })();
     </script>
 </body>
