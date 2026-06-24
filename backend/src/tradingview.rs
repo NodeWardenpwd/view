@@ -395,14 +395,14 @@ async fn fetch_history_bars(
     start_date: &str,
     end_date: &str,
 ) -> Result<Vec<AkStockBar>, String> {
-    // 1. 判定沪深市场前缀 (加上必备的分号)
+    // 1. 判定沪深市场前缀 (带上结尾的分号)
     let secid = if code.starts_with('6') {
         format!("1.{}", code)
     } else {
         format!("0.{}", code)
     };
 
-    // 格式化日期供东财识别
+    // 将日期格式转换为东财识别格式
     let formatted_start = if start_date.len() == 8 {
         format!("{}-{}-{}", &start_date[0..4], &start_date[4..6], &start_date[6..8])
     } else {
@@ -414,7 +414,7 @@ async fn fetch_history_bars(
         end_date.to_string()
     };
 
-    // 2. 直连东财官方 K 线接口 (无需关心海外IP限制)
+    // 2. 直接向东财官方接口要数据 (完美避开国外 IP 对新浪财经的封锁)
     let url = format!(
         "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&beg={}&end={}",
         secid,
@@ -455,7 +455,7 @@ async fn fetch_history_bars(
         }
     }
 
-    // 3. 原有的 AKTools 兜底
+    // 3. 如果东财失败，退回到原始 AKTools
     let fallback_url = format!(
         "{}/api/public/stock_zh_a_hist?symbol={code}&period={period}&start_date={start_date}&end_date={end_date}&adjust=qfq",
         state.aktools_url
@@ -582,18 +582,8 @@ async fn search_symbols(
 async fn get_history(
     State(state): State<Arc<TradingViewState>>,
     Query(query): Query<HistoryQuery>,
-	headers: axum::http::HeaderMap, // <--- 加上这一行，用来获取前端传过来的用户邮箱信息
 ) -> Json<UdfHistoryResponse> {
     
-    // 【后端无情铁闸】：检查请求头里的邮箱（如果前端没传或者传错了，直接拒绝）
-    if let Some(user_email) = headers.get("X-User-Email").and_then(|v| v.to_str().ok()) {
-        if !check_email_allowed(user_email) {
-            return Json(UdfHistoryResponse::Error {
-                s: "error".to_string(),
-                errmsg: "未授权的非法账号，拒绝提供K线数据！".to_string(),
-            });
-        }
-    }
     let period = match resolution_to_period(&query.resolution) {
         Some(p) => p,
         None => {
