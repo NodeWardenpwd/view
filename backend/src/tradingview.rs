@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
 };
-use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono::{FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use futures::StreamExt;
 use log::{debug, error, info, warn};
 use reqwest::Client;
@@ -20,12 +20,13 @@ use tokio::time::sleep;
 
 const SHANGHAI_OFFSET_SECS: i32 = 8 * 3600;
 const SUPPORTED_RESOLUTIONS: &[&str] = &["1", "5", "15", "30", "60", "D", "W", "M"];
-const EASTMONEY_KLINE_URL: &str = "https://push2his.eastmoney.com/api/qt/stock/kline/get";
+const TENCENT_MINS_URL: &str = "https://ifzq.gtimg.cn/appsh/tech/kline/mins";
+const TENCENT_KLINE_URL: &str = "https://proxy.finance.qq.com/ifzqgtimg/appsh/tech/kline/kline";
 const EASTMONEY_QUOTE_URL: &str = "https://push2.eastmoney.com/api/qt/ulist.np/get";
 const EASTMONEY_LIST_URL: &str = "https://push2.eastmoney.com/api/qt/clist/get";
-const EASTMONEY_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-const EASTMONEY_MAX_RETRIES: u32 = 3;
-const EASTMONEY_RETRY_DELAY_MS: u64 = 500;
+const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const HTTP_MAX_RETRIES: u32 = 3;
+const HTTP_RETRY_DELAY_MS: u64 = 500;
 
 pub struct TradingViewState {
     pub http: Client,
@@ -428,13 +429,6 @@ fn build_stock_entry(code: String, name: String) -> StockEntry {
     }
 }
 
-fn unix_to_yyyymmdd(ts: i64) -> String {
-    DateTime::<Utc>::from_timestamp(ts, 0)
-        .unwrap_or_else(Utc::now)
-        .format("%Y%m%d")
-        .to_string()
-}
-
 fn parse_bar_timestamp(date_str: &str) -> Option<i64> {
     let value = date_str.trim();
     let shanghai = FixedOffset::east_opt(SHANGHAI_OFFSET_SECS)?;
@@ -467,18 +461,107 @@ fn parse_bar_timestamp(date_str: &str) -> Option<i64> {
     None
 }
 
-fn resolution_to_klt(resolution: &str) -> Option<u32> {
+fn normalize_resolution(resolution: &str) -> Option<&'static str> {
     match resolution {
-        "1" => Some(1),
-        "5" => Some(5),
-        "15" => Some(15),
-        "30" => Some(30),
-        "60" => Some(60),
-        "D" | "1D" => Some(101),
-        "W" | "1W" => Some(102),
-        "M" | "1M" => Some(103),
+        "1" => Some("1"),
+        "5" => Some("5"),
+        "15" => Some("15"),
+        "30" => Some("30"),
+        "60" => Some("60"),
+        "D" | "1D" => Some("D"),
+        "W" | "1W" => Some("W"),
+        "M" | "1M" => Some("M"),
         _ => None,
     }
+}
+
+fn tencent_market(clean_code: &str) -> &'static str {
+    if clean_code.starts_with('6') {
+        "sh"
+    } else {
+        "sz"
+    }
+}
+
+fn tencent_symbol(market: &str, clean_code: &str) -> String {
+    format!("{market}{clean_code}")
+}
+
+fn tencent_kline_url(market: &str, clean_code: &str, period: &str) -> Option<String> {
+    let symbol = tencent_symbol(market, clean_code);
+    if matches!(period, "1" | "5" | "15" | "30" | "60") {
+        Some(format!(
+            "{TENCENT_MINS_URL}?symbol={symbol}&type=m{period}"
+        ))
+    } else if matches!(period, "D" | "W" | "M") {
+        Some(format!(
+            "{TENCENT_KLINE_URL}?symbol={symbol}&type=qfq{}",
+            period.to_lowercase()
+        ))
+    } else {
+        None
+    }
+}
+
+fn tencent_data_key(period: &str) -> String {
+    if matches!(period, "1" | "5" | "15" | "30" | "60") {
+        format!("m{period}")
+    } else {
+        format!("qfq{}", period.to_lowercase())
+    }
+}
+
+fn json_to_f64(value: &serde_json::Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str()?.parse().ok())
+        .or_else(|| value.as_i64().map(|v| v as f64))
+}
+
+fn parse_tencent_bar(row: &serde_json::Value) -> Option<StockBar> {
+    let items = row.as_array()?;
+    if items.len() < 6 {
+        return None;
+    }
+    Some(StockBar {
+        date: items[0].as_str()?.to_string(),
+        open: json_to_f64(&items[1])?,
+        close: json_to_f64(&items[2])?,
+        high: json_to_f64(&items[3])?,
+        low: json_to_f64(&items[4])?,
+        volume: json_to_f64(&items[5])?,
+    })
+}
+
+fn extract_tencent_bars(json: &serde_json::Value, symbol: &str, data_key: &str) -> Vec<StockBar> {
+    let data = &json["data"];
+
+    let candidates = [
+        data.get(symbol).and_then(|v| v.get(data_key)),
+        data.get(data_key),
+    ];
+
+    for candidate in candidates.into_iter().flatten() {
+        if let Some(rows) = candidate.as_array() {
+            let bars: Vec<StockBar> = rows.iter().filter_map(parse_tencent_bar).collect();
+            if !bars.is_empty() {
+                return bars;
+            }
+        }
+    }
+
+    if let Some(obj) = data.as_object() {
+        for value in obj.values() {
+            if let Some(rows) = value.get(data_key).and_then(|v| v.as_array()) {
+                let bars: Vec<StockBar> = rows.iter().filter_map(parse_tencent_bar).collect();
+                if !bars.is_empty() {
+                    return bars;
+                }
+            }
+        }
+    }
+
+    Vec::new()
 }
 
 fn build_symbol_info(tv_symbol: &str, name: Option<String>) -> UdfSymbolInfo {
@@ -512,58 +595,35 @@ fn build_symbol_info(tv_symbol: &str, name: Option<String>) -> UdfSymbolInfo {
     }
 }
 
-fn parse_eastmoney_kline(line: &str) -> Option<StockBar> {
-    let parts: Vec<&str> = line.split(',').collect();
-    if parts.len() < 6 {
-        return None;
-    }
-    Some(StockBar {
-        date: parts[0].to_string(),
-        open: parts[1].parse().unwrap_or(0.0),
-        close: parts[2].parse().unwrap_or(0.0),
-        high: parts[3].parse().unwrap_or(0.0),
-        low: parts[4].parse().unwrap_or(0.0),
-        volume: parts[5].parse().unwrap_or(0.0),
-    })
+fn browser_request(client: &Client, url: &str) -> reqwest::RequestBuilder {
+    client.get(url).header("User-Agent", BROWSER_UA)
 }
 
-fn eastmoney_request(client: &Client, url: &str) -> reqwest::RequestBuilder {
-    client
-        .get(url)
-        .header("User-Agent", EASTMONEY_UA)
-        .header("Referer", "https://quote.eastmoney.com/")
-        .header("Accept", "*/*")
-        .header("Accept-Language", "zh-CN,zh;q=0.9")
-}
+async fn http_get_with_retry(client: &Client, url: &str, label: &str) -> Result<reqwest::Response, String> {
+    let mut last_err = format!("{label} request failed: unknown error");
 
-async fn eastmoney_get_with_retry(
-    client: &Client,
-    url: &str,
-) -> Result<reqwest::Response, String> {
-    let mut last_err = "EastMoney request failed: unknown error".to_string();
-
-    for attempt in 0..EASTMONEY_MAX_RETRIES {
+    for attempt in 0..HTTP_MAX_RETRIES {
         if attempt > 0 {
-            sleep(Duration::from_millis(EASTMONEY_RETRY_DELAY_MS)).await;
+            sleep(Duration::from_millis(HTTP_RETRY_DELAY_MS)).await;
         }
 
-        match eastmoney_request(client, url).send().await {
+        match browser_request(client, url).send().await {
             Ok(resp) if resp.status().is_success() => return Ok(resp),
             Ok(resp) => {
-                last_err = format!("EastMoney HTTP {}", resp.status());
+                last_err = format!("{label} HTTP {}", resp.status());
                 warn!(
-                    "EastMoney request attempt {}/{} got HTTP {}",
+                    "{label} request attempt {}/{} got HTTP {}",
                     attempt + 1,
-                    EASTMONEY_MAX_RETRIES,
+                    HTTP_MAX_RETRIES,
                     resp.status()
                 );
             }
             Err(e) => {
-                last_err = format!("EastMoney request failed: {e}");
+                last_err = format!("{label} request failed: {e}");
                 warn!(
-                    "EastMoney request attempt {}/{} failed: {e}",
+                    "{label} request attempt {}/{} failed: {e}",
                     attempt + 1,
-                    EASTMONEY_MAX_RETRIES
+                    HTTP_MAX_RETRIES
                 );
             }
         }
@@ -584,7 +644,7 @@ async fn load_symbol_directory(state: &TradingViewState) -> Result<Vec<StockEntr
         "{EASTMONEY_LIST_URL}?pn=1&pz=5000&po=1&np=1&fltt=2&invt=2&fid=f12&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f12,f14"
     );
 
-    let resp = eastmoney_get_with_retry(&state.http, &url)
+    let resp = http_get_with_retry(&state.http, &url, "EastMoney symbol list")
         .await
         .map_err(|e| format!("EastMoney symbol list request failed: {e}"))?;
 
@@ -633,9 +693,7 @@ async fn find_stock_entry(state: &TradingViewState, tv_symbol: &str) -> StockEnt
 async fn fetch_history_bars(
     state: &TradingViewState,
     code: &str,
-    klt: u32,
-    start_date: &str,
-    end_date: &str,
+    period: &str,
 ) -> Result<Vec<StockBar>, String> {
     let clean_code = extract_code_6(code);
 
@@ -643,35 +701,27 @@ async fn fetch_history_bars(
         return Err(format!("Invalid A-share code: {code}"));
     }
 
-    let secid = eastmoney_secid(&clean_code);
-    let beg = start_date.replace('-', "");
-    let end = end_date.replace('-', "");
+    let market = tencent_market(&clean_code);
+    let symbol = tencent_symbol(market, &clean_code);
+    let url = tencent_kline_url(market, &clean_code, period)
+        .ok_or_else(|| format!("Unsupported period: {period}"))?;
+    let data_key = tencent_data_key(period);
 
-    let url = format!(
-        "{EASTMONEY_KLINE_URL}?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt={klt}&fqt=1&beg={beg}&end={end}"
-    );
+    debug!("Tencent kline request: {}", url);
 
-    debug!("EastMoney kline request: {}", url);
-
-    let resp = eastmoney_get_with_retry(&state.http, &url).await?;
+    let resp = http_get_with_retry(&state.http, &url, "Tencent kline").await?;
 
     let json: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse EastMoney JSON: {e}"))?;
+        .map_err(|e| format!("Failed to parse Tencent JSON: {e}"))?;
 
-    let klines = json["data"]["klines"]
-        .as_array()
-        .ok_or_else(|| "EastMoney response missing data.klines".to_string())?;
-
-    let bars: Vec<StockBar> = klines
-        .iter()
-        .filter_map(|item| item.as_str())
-        .filter_map(parse_eastmoney_kline)
-        .collect();
+    let bars = extract_tencent_bars(&json, &symbol, &data_key);
 
     if bars.is_empty() {
-        return Err("EastMoney returned empty klines".to_string());
+        return Err(format!(
+            "Tencent returned empty klines for {symbol} ({data_key})"
+        ));
     }
 
     Ok(bars)
@@ -697,7 +747,7 @@ async fn fetch_quotes(
 
     let mut result = HashMap::new();
 
-    let Ok(resp) = eastmoney_get_with_retry(&state.http, &url).await else {
+    let Ok(resp) = http_get_with_retry(&state.http, &url, "EastMoney quotes").await else {
         return result;
     };
     let Ok(json) = resp.json::<serde_json::Value>().await else {
@@ -849,8 +899,8 @@ async fn get_history(
         return Ok(unauthorized_history());
     }
 
-    let klt = match resolution_to_klt(&query.resolution) {
-        Some(klt) => klt,
+    let period = match normalize_resolution(&query.resolution) {
+        Some(period) => period,
         None => {
             return Ok(Json(UdfHistoryResponse::NoData {
                 s: "no_data".to_string(),
@@ -867,10 +917,7 @@ async fn get_history(
         }));
     }
 
-    let start_date = unix_to_yyyymmdd(query.from);
-    let end_date = unix_to_yyyymmdd(query.to);
-
-    match fetch_history_bars(&state, &code, klt, &start_date, &end_date).await {
+    match fetch_history_bars(&state, &code, period).await {
         Ok(bars) => {
             let mut parsed: Vec<(i64, &StockBar)> = bars
                 .iter()
