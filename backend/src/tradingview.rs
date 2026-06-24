@@ -6,7 +6,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
-use futures::{SinkExt, StreamExt};
+use futures::{StreamExt};
 use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -194,6 +194,7 @@ struct SymbolQuery {
 }
 
 #[derive(Deserialize)]
+#[allow(dead_code)]
 struct SearchQuery {
     query: Option<String>,
     #[serde(rename = "type")]
