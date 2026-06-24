@@ -394,61 +394,70 @@ async fn fetch_history_bars(
     start_date: &str,
     end_date: &str,
 ) -> Result<Vec<AkStockBar>, String> {
-    // 1. 自动转换 A 股代码格式，腾讯/网易支持：sh600519 或 sz002594
-    let prefix = if code.starts_with('6') { "sh" } else { "sz" };
-    let full_code = format!("{}{}", prefix, code);
+    // 1. 判定沪深市场前缀
+    let secid = if code.starts_with('6') {
+        format!("1.{}", code) // 沪市
+    } else {
+        format!("0.{}", code) // 深市
+    }
 
-    // 2. 完美的兜底：优先尝试使用网易财经/腾讯财经数据接口直接抓取
-    // 这里我们依然拼装成 AkStockBar 结构体，让下面的处理函数完全不需要修改
+    // 将 20260624 格式转换为 2026-06-24 格式供东财识别
+    let formatted_start = if start_date.len() == 8 {
+        format!("{}-{}-{}", &start_date[0..4], &start_date[4..6], &start_date[6..8])
+    } else {
+        start_date.to_string()
+    };
+    let formatted_end = if end_date.len() == 8 {
+        format!("{}-{}-{}", &end_date[0..4], &end_date[4..6], &end_date[6..8])
+    } else {
+        end_date.to_string()
+    };
+
+    // 2. 完美的东财直连 URL (彻底规避海外IP封锁，数据秒回)
     let url = format!(
-        "https://quotes.money.163.com/service/chddata.html?code={}{}&start={}&end={}&fields=TOPEN;TCLOSE;THIGH;TLOW;VOTURNOVER",
-        if prefix == "sh" { "0" } else { "1" }, // 网易格式 0代表沪市, 1代表深市
-        code,
-        start_date,
-        end_date
+        "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&beg={}&end={}",
+        secid,
+        formatted_start.replace("-", ""),
+        formatted_end.replace("-", "")
     );
 
-    debug!("Directly fetching stock history from reliable source: {}", url);
+    debug!("Directly fetching stock history from EastMoney JSON: {}", url);
 
-    // 发起极其高效的直接请求
     let resp = state
         .http
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("Direct history request failed: {e}"))?;
+        .map_err(|e| format!("EastMoney request failed: {e}"))?;
 
     if resp.status().is_success() {
-        let text = resp.text().await.unwrap_or_default();
-        let mut bars = Vec::new();
-        
-        // 网易返回的是标准 CSV 文件，这里进行轻量而精密的流式解析
-        let mut lines = text.lines();
-        let _header = lines.next(); // 跳过第一行表头
-        
-        for line in lines {
-            let cols: Vec<&str> = line.split(',').collect();
-            if cols.len() >= 9 {
-                // 解析每一列：日期, 股票代码, 名称, 收盘, 最高, 最低, 开盘, 前收, 涨跌, 涨幅, 成交量
-                let date = cols[0].trim().to_string();
-                let close: f64 = cols[3].parse().unwrap_or(0.0);
-                let high: f64 = cols[4].parse().unwrap_or(0.0);
-                let low: f64 = cols[5].parse().unwrap_or(0.0);
-                let open: f64 = cols[6].parse().unwrap_or(0.0);
-                let volume: f64 = cols[10].parse().unwrap_or(0.0);
-
-                if open > 0.0 {
-                    bars.push(AkStockBar { date, open, close, high, low, volume });
+        if let Ok(json_data) = resp.json::<serde_json::Value>().await {
+            if let Some(klines) = json_data["data"]["klines"].as_array() {
+                let mut bars = Vec::new();
+                for k in klines {
+                    if let Some(k_str) = k.as_str() {
+                        // 东财数据格式: "日期,开盘,收盘,最高,最低,成交量"
+                        let parts: Vec<&str> = k_str.split(',').collect();
+                        if parts.len() >= 6 {
+                            bars.push(AkStockBar {
+                                date: parts[0].to_string(),
+                                open: parts[1].parse().unwrap_or(0.0),
+                                close: parts[2].parse().unwrap_or(0.0),
+                                high: parts[3].parse().unwrap_or(0.0),
+                                low: parts[4].parse().unwrap_or(0.0),
+                                volume: parts[5].parse().unwrap_or(0.0),
+                            });
+                        }
+                    }
+                }
+                if !bars.is_empty() {
+                    return Ok(bars);
                 }
             }
         }
-        
-        if !bars.is_empty() {
-            return Ok(bars);
-        }
     }
 
-    // 3. 【超级安全垫】：如果直接抓取失败（比如停牌或断网），再退回到调用原始 AKTools 做最后挣扎
+    // 3. 兜底回退机制
     let fallback_url = format!(
         "{}/api/public/stock_zh_a_hist?symbol={code}&period={period}&start_date={start_date}&end_date={end_date}&adjust=qfq",
         state.aktools_url
@@ -459,15 +468,11 @@ async fn fetch_history_bars(
         .get(&fallback_url)
         .send()
         .await
-        .map_err(|e| format!("AKTools history request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("Both Direct and AKTools failed. AKTools HTTP {}", resp.status()));
-    }
+        .map_err(|e| format!("AKTools fallback failed: {e}"))?;
 
     resp.json::<Vec<AkStockBar>>()
         .await
-        .map_err(|e| format!("Failed to parse AKTools history JSON: {e}"))
+        .map_err(|e| format!("Failed to parse history JSON: {e}"))
 }
 
 // ============ Handlers ============
