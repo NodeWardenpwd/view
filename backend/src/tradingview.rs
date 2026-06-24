@@ -22,8 +22,8 @@ const SHANGHAI_OFFSET_SECS: i32 = 8 * 3600;
 const SUPPORTED_RESOLUTIONS: &[&str] = &["1", "5", "15", "30", "60", "D", "W", "M"];
 const TENCENT_MINS_URL: &str = "https://ifzq.gtimg.cn/appsh/tech/kline/mins";
 const TENCENT_KLINE_URL: &str = "https://proxy.finance.qq.com/ifzqgtimg/appsh/tech/kline/kline";
-const EASTMONEY_QUOTE_URL: &str = "https://push2.eastmoney.com/api/qt/ulist.np/get";
-const EASTMONEY_LIST_URL: &str = "https://push2.eastmoney.com/api/qt/clist/get";
+const TENCENT_QT_URL: &str = "https://qt.gtimg.cn/q=";
+const TENCENT_SEARCH_URL: &str = "https://proxy.finance.qq.com/ifzqgtimg/appstock/code/search";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 const HTTP_MAX_RETRIES: u32 = 3;
 const HTTP_RETRY_DELAY_MS: u64 = 500;
@@ -53,7 +53,7 @@ struct StockBar {
 
 impl TradingViewState {
     pub fn new() -> Self {
-        info!("TradingView UDF proxy initialized (East Money data source)");
+        info!("TradingView UDF proxy initialized (Tencent Finance data source)");
         Self {
             http: Client::builder()
                 .timeout(Duration::from_secs(60))
@@ -393,8 +393,19 @@ fn normalize_tv_symbol(symbol: &str) -> String {
     }
 }
 
-fn extract_code_6(symbol: &str) -> String {
-    let digits: String = symbol.chars().filter(|c| c.is_ascii_digit()).collect();
+#[derive(Debug, Clone)]
+struct TencentQuote {
+    tv_symbol: String,
+    name: String,
+    code: String,
+    last: f64,
+    open: f64,
+    change: f64,
+    change_percent: f64,
+}
+
+fn clean_code_digits(raw: &str) -> String {
+    let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
     if digits.len() >= 6 {
         digits[digits.len() - 6..].to_string()
     } else {
@@ -402,20 +413,15 @@ fn extract_code_6(symbol: &str) -> String {
     }
 }
 
+fn extract_code_6(symbol: &str) -> String {
+    clean_code_digits(symbol)
+}
+
 fn exchange_for_code(code: &str) -> (&'static str, &'static str) {
     if code.starts_with('6') {
         ("SSE", "sh")
     } else {
         ("SZSE", "sz")
-    }
-}
-
-fn eastmoney_secid(code: &str) -> String {
-    let clean_code = extract_code_6(code);
-    if clean_code.starts_with('6') {
-        format!("1.{clean_code}")
-    } else {
-        format!("0.{clean_code}")
     }
 }
 
@@ -632,62 +638,221 @@ async fn http_get_with_retry(client: &Client, url: &str, label: &str) -> Result<
     Err(last_err)
 }
 
-async fn load_symbol_directory(state: &TradingViewState) -> Result<Vec<StockEntry>, String> {
-    {
-        let cache = state.symbol_cache.read().await;
-        if !cache.is_empty() {
-            return Ok(cache.clone());
+async fn http_get_text_with_retry(
+    client: &Client,
+    url: &str,
+    label: &str,
+) -> Result<String, String> {
+    let resp = http_get_with_retry(client, url, label).await?;
+    resp.text()
+        .await
+        .map_err(|e| format!("{label} response read failed: {e}"))
+}
+
+fn parse_str_f64(value: &str) -> Option<f64> {
+    if value.is_empty() {
+        return None;
+    }
+    value.parse().ok()
+}
+
+fn parse_qt_line(line: &str) -> Option<TencentQuote> {
+    let line = line.trim();
+    let eq_pos = line.find('=')?;
+    if !line.starts_with("v_") {
+        return None;
+    }
+
+    let tv_symbol = line[2..eq_pos].trim().to_lowercase();
+    let raw_value = line[eq_pos + 1..].trim().trim_matches('"');
+    let fields: Vec<&str> = raw_value.split('~').collect();
+    if fields.len() < 4 {
+        return None;
+    }
+
+    let name = fields[1].trim().to_string();
+    let code = fields[2].trim().to_string();
+    let last = parse_str_f64(fields[3].trim())?;
+    let prev_close = fields
+        .get(4)
+        .and_then(|v| parse_str_f64(v.trim()))
+        .unwrap_or(last);
+    let open = fields
+        .get(5)
+        .and_then(|v| parse_str_f64(v.trim()))
+        .unwrap_or(prev_close);
+
+    let change = last - prev_close;
+    let change_percent = if prev_close.abs() > f64::EPSILON {
+        change / prev_close * 100.0
+    } else {
+        0.0
+    };
+
+    Some(TencentQuote {
+        tv_symbol: normalize_tv_symbol(&tv_symbol),
+        name,
+        code,
+        last,
+        open,
+        change,
+        change_percent,
+    })
+}
+
+fn parse_qt_response(body: &str) -> HashMap<String, TencentQuote> {
+    let mut quotes = HashMap::new();
+    for line in body.lines() {
+        if let Some(quote) = parse_qt_line(line) {
+            quotes.insert(quote.tv_symbol.clone(), quote);
         }
+    }
+    quotes
+}
+
+fn tv_symbol_to_qt_param(tv_symbol: &str) -> Option<String> {
+    let clean_code = clean_code_digits(tv_symbol);
+    if clean_code.len() != 6 {
+        return None;
+    }
+    Some(tencent_symbol(tencent_market(&clean_code), &clean_code))
+}
+
+async fn fetch_tencent_quotes(
+    state: &TradingViewState,
+    tv_symbols: &[String],
+) -> HashMap<String, TencentQuote> {
+    let qt_symbols: Vec<String> = tv_symbols
+        .iter()
+        .filter_map(|s| tv_symbol_to_qt_param(s))
+        .collect();
+
+    if qt_symbols.is_empty() {
+        return HashMap::new();
+    }
+
+    let url = format!("{TENCENT_QT_URL}{}", qt_symbols.join(","));
+    debug!("Tencent quote request: {}", url);
+
+    let Ok(body) = http_get_text_with_retry(&state.http, &url, "Tencent quote").await else {
+        return HashMap::new();
+    };
+
+    parse_qt_response(&body)
+}
+
+async fn fetch_tencent_symbol_entry(
+    state: &TradingViewState,
+    tv_symbol: &str,
+) -> Option<StockEntry> {
+    let normalized = normalize_tv_symbol(tv_symbol);
+    let quotes = fetch_tencent_quotes(state, &[normalized.clone()]).await;
+    quotes.get(&normalized).map(|q| {
+        build_stock_entry(q.code.clone(), q.name.clone())
+    })
+}
+
+async fn search_tencent_symbols(
+    state: &TradingViewState,
+    query: &str,
+    limit: usize,
+) -> Vec<StockEntry> {
+    if query.is_empty() {
+        return load_tracked_stock_entries(state).await;
     }
 
     let url = format!(
-        "{EASTMONEY_LIST_URL}?pn=1&pz=5000&po=1&np=1&fltt=2&invt=2&fid=f12&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f12,f14"
+        "{TENCENT_SEARCH_URL}?keyword={}&market=&type=&page=1&count={limit}",
+        urlencoding(query)
     );
 
-    let resp = http_get_with_retry(&state.http, &url, "EastMoney symbol list")
-        .await
-        .map_err(|e| format!("EastMoney symbol list request failed: {e}"))?;
+    let Ok(resp) = http_get_with_retry(&state.http, &url, "Tencent symbol search").await else {
+        return Vec::new();
+    };
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return Vec::new();
+    };
 
-    let json: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse EastMoney symbol list: {e}"))?;
+    let mut entries = Vec::new();
+    let arrays = [
+        json["data"]["stock"].as_array(),
+        json["data"]["all"].as_array(),
+        json["data"].as_array(),
+    ];
 
-    let entries: Vec<StockEntry> = json["data"]["diff"]
-        .as_array()
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter_map(|row| {
-            let code = row["f12"].as_str()?.trim();
-            let name = row["f14"].as_str()?.trim();
-            if code.len() == 6 {
-                Some(build_stock_entry(code.to_string(), name.to_string()))
-            } else {
-                None
+    for arr in arrays.into_iter().flatten() {
+        for item in arr {
+            let code_raw = item["code"]
+                .as_str()
+                .or_else(|| item["symbol"].as_str())
+                .unwrap_or_default();
+            let name = item["name"].as_str().unwrap_or_default().to_string();
+            if code_raw.is_empty() {
+                continue;
             }
-        })
-        .collect();
-
-    {
-        let mut cache = state.symbol_cache.write().await;
-        *cache = entries.clone();
-    }
-
-    info!("Loaded {} A-share symbols from East Money", entries.len());
-    Ok(entries)
-}
-
-async fn find_stock_entry(state: &TradingViewState, tv_symbol: &str) -> StockEntry {
-    let normalized = normalize_tv_symbol(tv_symbol);
-    let code = extract_code_6(&normalized);
-
-    if let Ok(entries) = load_symbol_directory(state).await {
-        if let Some(entry) = entries.iter().find(|e| e.code == code) {
-            return entry.clone();
+            let tv_symbol = normalize_tv_symbol(code_raw);
+            let clean_code = clean_code_digits(&tv_symbol);
+            if clean_code.len() == 6 {
+                entries.push(build_stock_entry(clean_code, name));
+            }
+            if entries.len() >= limit {
+                return entries;
+            }
+        }
+        if !entries.is_empty() {
+            return entries;
         }
     }
 
-    build_stock_entry(code.clone(), code)
+    entries
+}
+
+fn urlencoding(input: &str) -> String {
+    input
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
+async fn load_tracked_stock_entries(state: &TradingViewState) -> Vec<StockEntry> {
+    {
+        let cache = state.symbol_cache.read().await;
+        if !cache.is_empty() {
+            return cache.clone();
+        }
+    }
+
+    let tracked = TradingViewState::get_tracked_symbols_from_env();
+    let quotes = fetch_tencent_quotes(state, &tracked).await;
+
+    let entries: Vec<StockEntry> = tracked
+        .iter()
+        .filter_map(|symbol| {
+            quotes.get(symbol).map(|q| build_stock_entry(q.code.clone(), q.name.clone()))
+        })
+        .collect();
+
+    if !entries.is_empty() {
+        let mut cache = state.symbol_cache.write().await;
+        *cache = entries.clone();
+        info!("Loaded {} tracked symbols from Tencent Finance", entries.len());
+    }
+
+    entries
+}
+
+async fn find_stock_entry(state: &TradingViewState, tv_symbol: &str) -> StockEntry {
+    if let Some(entry) = fetch_tencent_symbol_entry(state, tv_symbol).await {
+        return entry;
+    }
+
+    let clean_code = clean_code_digits(tv_symbol);
+    build_stock_entry(clean_code.clone(), clean_code)
 }
 
 async fn fetch_history_bars(
@@ -695,7 +860,7 @@ async fn fetch_history_bars(
     code: &str,
     period: &str,
 ) -> Result<Vec<StockBar>, String> {
-    let clean_code = extract_code_6(code);
+    let clean_code = clean_code_digits(code);
 
     if clean_code.len() != 6 {
         return Err(format!("Invalid A-share code: {code}"));
@@ -731,54 +896,22 @@ async fn fetch_quotes(
     state: &TradingViewState,
     tv_symbols: &[String],
 ) -> HashMap<String, QuoteItem> {
-    if tv_symbols.is_empty() {
-        return HashMap::new();
-    }
-
-    let secids: Vec<String> = tv_symbols
-        .iter()
-        .map(|symbol| eastmoney_secid(&extract_code_6(symbol)))
-        .collect();
-
-    let url = format!(
-        "{EASTMONEY_QUOTE_URL}?fltt=2&fields=f2,f3,f4,f46,f12,f14&secids={}",
-        secids.join(",")
-    );
-
-    let mut result = HashMap::new();
-
-    let Ok(resp) = http_get_with_retry(&state.http, &url, "EastMoney quotes").await else {
-        return result;
-    };
-    let Ok(json) = resp.json::<serde_json::Value>().await else {
-        return result;
-    };
-
-    if let Some(items) = json["data"]["diff"].as_array().or_else(|| json["data"]["full"].as_array()) {
-        for item in items {
-            let code = item["f12"].as_str().unwrap_or_default();
-            if code.len() != 6 {
-                continue;
-            }
-            let tv_symbol = normalize_tv_symbol(code);
-            let last = item["f2"].as_f64().unwrap_or(0.0);
-            let change_percent = item["f3"].as_f64().unwrap_or(0.0);
-            let change = item["f4"].as_f64().unwrap_or(0.0);
-            let open = item["f46"].as_f64().unwrap_or(last - change);
-            result.insert(
-                tv_symbol.clone(),
+    let quotes = fetch_tencent_quotes(state, tv_symbols).await;
+    quotes
+        .into_iter()
+        .map(|(symbol, q)| {
+            (
+                symbol.clone(),
                 QuoteItem {
-                    symbol: tv_symbol,
-                    last,
-                    change,
-                    change_percent,
-                    open,
+                    symbol,
+                    last: q.last,
+                    change: q.change,
+                    change_percent: q.change_percent,
+                    open: q.open,
                 },
-            );
-        }
-    }
-
-    result
+            )
+        })
+        .collect()
 }
 
 // ============ Handlers ============
@@ -854,19 +987,18 @@ async fn search_symbols(
     let search_term = query.query.unwrap_or_default().to_lowercase();
     let limit = query.limit.unwrap_or(30).max(1) as usize;
 
-    let entries = match load_symbol_directory(&state).await {
-        Ok(entries) => entries,
-        Err(e) => {
-            warn!("Symbol search fallback due to: {}", e);
-            TradingViewState::get_tracked_symbols_from_env()
-                .into_iter()
-                .map(|s| {
-                    let code = extract_code_6(&s);
-                    build_stock_entry(code, s.clone())
-                })
-                .collect()
-        }
-    };
+    let mut entries = search_tencent_symbols(&state, &search_term, limit).await;
+
+    if entries.is_empty() {
+        warn!("Tencent symbol search empty, falling back to tracked symbols");
+        entries = TradingViewState::get_tracked_symbols_from_env()
+            .into_iter()
+            .map(|s| {
+                let code = clean_code_digits(&s);
+                build_stock_entry(code, s)
+            })
+            .collect();
+    }
 
     let results: Vec<UdfSearchResult> = entries
         .into_iter()

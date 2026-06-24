@@ -27,7 +27,7 @@ async fn main() {
     let addr = "0.0.0.0:3000";
     info!("Starting API server on {}", addr);
     info!("TradingView UDF: /config, /symbols, /search, /history, /time");
-    info!("Data source: East Money public API");
+    info!("Data source: Tencent Finance public API");
 
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
