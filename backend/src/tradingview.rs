@@ -26,7 +26,7 @@ pub struct TradingViewState {
 }
 
 #[derive(Clone, Debug)]
-struct StockEntry {
+pub struct StockEntry {
     code: String,
     name: String,
     exchange: String,
