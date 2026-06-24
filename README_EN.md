@@ -1,6 +1,6 @@
 # 📊 View — A-Share Chart Platform v3.0
 
-[🇨🇳 中文版 README](README_CN.md) · [English README](README_EN.md)
+[🇨🇳 中文版](README_CN.md) · [Main README](README.md)
 
 > **v3.0 Architecture Upgrade**
 >
@@ -12,8 +12,8 @@ A self-hosted **A-share (China stock)** charting platform. A lightweight Rust Ax
 
 ### Market Data (v3.0)
 - **East Money K-line API** — Daily / weekly / monthly + intraday (1/5/15/30/60 min), forward-adjusted (qfq)
-- **No local database required** — On-demand proxy; no TimescaleDB sync for chart data
-- **Anti-bot headers + retry** — Browser User-Agent / Referer disguise with 3-attempt retry for overseas deployments (e.g. Hugging Face)
+- **No local database required** — On-demand proxy; no historical sync pipeline
+- **Anti-bot headers + retry** — Browser User-Agent / Referer disguise with 3-attempt retry for overseas deployments
 - **Polling pseudo-realtime** — Frontend polls latest bars and watchlist quotes every 10–30 seconds
 
 ### Charting
@@ -35,7 +35,7 @@ tradingview/
 │   │   └── tradingview.rs    # UDF API + East Money proxy
 │   └── .env.example
 └── frontend/
-    ├── index.html            # Main chart app
+    ├── index.html
     ├── login.html
     ├── auth-config.js
     └── charting_library/
@@ -57,11 +57,8 @@ tradingview/
 ```bash
 cd backend
 cp .env.example .env
-# Edit .env: AUTH_DISABLED, ALLOWED_EMAILS, TRACKED_SYMBOL
 cargo run
 ```
-
-Server listens on `http://0.0.0.0:3000`.
 
 **`.env` example:**
 
@@ -77,20 +74,17 @@ TRACKED_SYMBOL=sh600519,sz000001,sz300750,sh601318
 ```bash
 cd frontend
 python serve.py
-# Open http://localhost:8080
 ```
-
-Local dev: `auth-config.js` points API to `http://localhost:3000`.
 
 ## 📡 API Endpoints
 
 | Endpoint | Description |
 |----------|-------------|
-| `GET /config` | UDF configuration (auth required) |
+| `GET /config` | UDF configuration |
 | `GET /symbols?symbol=sh600519` | Symbol metadata |
 | `GET /search?query=600519` | Symbol search |
 | `GET /history?symbol=...&resolution=...&from=...&to=...` | K-line history |
-| `GET /quotes?symbols=sh600519,sz000001` | Latest quotes for watchlist |
+| `GET /quotes?symbols=sh600519,sz000001` | Latest quotes |
 | `GET /auth/verify?email=...` | Whitelist check |
 
 ## 📜 License

@@ -6,26 +6,30 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
-use futures::{SinkExt, StreamExt};
+use futures::StreamExt;
 use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::RwLock;
+use tokio::time::sleep;
 
 const SHANGHAI_OFFSET_SECS: i32 = 8 * 3600;
 const SUPPORTED_RESOLUTIONS: &[&str] = &["1", "5", "15", "30", "60", "D", "W", "M"];
 const EASTMONEY_KLINE_URL: &str = "https://push2his.eastmoney.com/api/qt/stock/kline/get";
 const EASTMONEY_QUOTE_URL: &str = "https://push2.eastmoney.com/api/qt/ulist.np/get";
 const EASTMONEY_LIST_URL: &str = "https://push2.eastmoney.com/api/qt/clist/get";
+const EASTMONEY_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+const EASTMONEY_MAX_RETRIES: u32 = 3;
+const EASTMONEY_RETRY_DELAY_MS: u64 = 500;
 
 pub struct TradingViewState {
     pub http: Client,
-    pub symbol_cache: Arc<RwLock<Vec<StockEntry>>>,
+    symbol_cache: Arc<RwLock<Vec<StockEntry>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -51,8 +55,7 @@ impl TradingViewState {
         info!("TradingView UDF proxy initialized (East Money data source)");
         Self {
             http: Client::builder()
-                .timeout(std::time::Duration::from_secs(60))
-                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                .timeout(Duration::from_secs(60))
                 .build()
                 .expect("Failed to build HTTP client"),
             symbol_cache: Arc::new(RwLock::new(Vec::new())),
@@ -524,6 +527,51 @@ fn parse_eastmoney_kline(line: &str) -> Option<StockBar> {
     })
 }
 
+fn eastmoney_request(client: &Client, url: &str) -> reqwest::RequestBuilder {
+    client
+        .get(url)
+        .header("User-Agent", EASTMONEY_UA)
+        .header("Referer", "https://quote.eastmoney.com/")
+        .header("Accept", "*/*")
+        .header("Accept-Language", "zh-CN,zh;q=0.9")
+}
+
+async fn eastmoney_get_with_retry(
+    client: &Client,
+    url: &str,
+) -> Result<reqwest::Response, String> {
+    let mut last_err = "EastMoney request failed: unknown error".to_string();
+
+    for attempt in 0..EASTMONEY_MAX_RETRIES {
+        if attempt > 0 {
+            sleep(Duration::from_millis(EASTMONEY_RETRY_DELAY_MS)).await;
+        }
+
+        match eastmoney_request(client, url).send().await {
+            Ok(resp) if resp.status().is_success() => return Ok(resp),
+            Ok(resp) => {
+                last_err = format!("EastMoney HTTP {}", resp.status());
+                warn!(
+                    "EastMoney request attempt {}/{} got HTTP {}",
+                    attempt + 1,
+                    EASTMONEY_MAX_RETRIES,
+                    resp.status()
+                );
+            }
+            Err(e) => {
+                last_err = format!("EastMoney request failed: {e}");
+                warn!(
+                    "EastMoney request attempt {}/{} failed: {e}",
+                    attempt + 1,
+                    EASTMONEY_MAX_RETRIES
+                );
+            }
+        }
+    }
+
+    Err(last_err)
+}
+
 async fn load_symbol_directory(state: &TradingViewState) -> Result<Vec<StockEntry>, String> {
     {
         let cache = state.symbol_cache.read().await;
@@ -536,16 +584,9 @@ async fn load_symbol_directory(state: &TradingViewState) -> Result<Vec<StockEntr
         "{EASTMONEY_LIST_URL}?pn=1&pz=5000&po=1&np=1&fltt=2&invt=2&fid=f12&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f12,f14"
     );
 
-    let resp = state
-        .http
-        .get(&url)
-        .send()
+    let resp = eastmoney_get_with_retry(&state.http, &url)
         .await
         .map_err(|e| format!("EastMoney symbol list request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("EastMoney symbol list HTTP {}", resp.status()));
-    }
 
     let json: serde_json::Value = resp
         .json()
@@ -612,16 +653,7 @@ async fn fetch_history_bars(
 
     debug!("EastMoney kline request: {}", url);
 
-    let resp = state
-        .http
-        .get(&url)
-        .send()
-        .await
-        .map_err(|e| format!("EastMoney request failed: {e}"))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("EastMoney HTTP {}", resp.status()));
-    }
+    let resp = eastmoney_get_with_retry(&state.http, &url).await?;
 
     let json: serde_json::Value = resp
         .json()
@@ -665,12 +697,9 @@ async fn fetch_quotes(
 
     let mut result = HashMap::new();
 
-    let Ok(resp) = state.http.get(&url).send().await else {
+    let Ok(resp) = eastmoney_get_with_retry(&state.http, &url).await else {
         return result;
     };
-    if !resp.status().is_success() {
-        return result;
-    }
     let Ok(json) = resp.json::<serde_json::Value>().await else {
         return result;
     };
