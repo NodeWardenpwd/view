@@ -395,14 +395,14 @@ async fn fetch_history_bars(
     start_date: &str,
     end_date: &str,
 ) -> Result<Vec<AkStockBar>, String> {
-    // 1. 判定沪深市场前缀
+    // 1. 判定沪深市场前缀 (加上必备的分号)
     let secid = if code.starts_with('6') {
-        format!("1.{}", code) // 沪市
+        format!("1.{}", code)
     } else {
-        format!("0.{}", code) // 深市
+        format!("0.{}", code)
     };
 
-    // 将 20260624 格式转换为 2026-06-24 格式供东财识别
+    // 格式化日期供东财识别
     let formatted_start = if start_date.len() == 8 {
         format!("{}-{}-{}", &start_date[0..4], &start_date[4..6], &start_date[6..8])
     } else {
@@ -414,15 +414,13 @@ async fn fetch_history_bars(
         end_date.to_string()
     };
 
-    // 2. 完美的东财直连 URL (彻底规避海外IP封锁，数据秒回)
+    // 2. 直连东财官方 K 线接口 (无需关心海外IP限制)
     let url = format!(
         "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&beg={}&end={}",
         secid,
         formatted_start.replace("-", ""),
         formatted_end.replace("-", "")
     );
-
-    debug!("Directly fetching stock history from EastMoney JSON: {}", url);
 
     let resp = state
         .http
@@ -437,7 +435,6 @@ async fn fetch_history_bars(
                 let mut bars = Vec::new();
                 for k in klines {
                     if let Some(k_str) = k.as_str() {
-                        // 东财数据格式: "日期,开盘,收盘,最高,最低,成交量"
                         let parts: Vec<&str> = k_str.split(',').collect();
                         if parts.len() >= 6 {
                             bars.push(AkStockBar {
@@ -458,7 +455,7 @@ async fn fetch_history_bars(
         }
     }
 
-    // 3. 兜底回退机制
+    // 3. 原有的 AKTools 兜底
     let fallback_url = format!(
         "{}/api/public/stock_zh_a_hist?symbol={code}&period={period}&start_date={start_date}&end_date={end_date}&adjust=qfq",
         state.aktools_url
