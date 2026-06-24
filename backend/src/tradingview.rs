@@ -76,6 +76,7 @@ pub fn tradingview_routes() -> Router<Arc<TradingViewState>> {
         .route("/canvas/load", get(canvas_load))
         .route("/canvas/save", post(canvas_save))
         .route("/canvas/delete", delete(canvas_delete))
+		.route("/auth/verify", get(verify_email))
 }
 
 // ============ AKTools Data Models ============
