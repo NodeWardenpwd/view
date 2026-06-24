@@ -407,10 +407,11 @@ fn exchange_for_code(code: &str) -> (&'static str, &'static str) {
 }
 
 fn eastmoney_secid(code: &str) -> String {
-    if code.starts_with('6') {
-        format!("1.{code}")
+    let clean_code = extract_code_6(code);
+    if clean_code.starts_with('6') {
+        format!("1.{clean_code}")
     } else {
-        format!("0.{code}")
+        format!("0.{clean_code}")
     }
 }
 
@@ -595,7 +596,13 @@ async fn fetch_history_bars(
     start_date: &str,
     end_date: &str,
 ) -> Result<Vec<StockBar>, String> {
-    let secid = eastmoney_secid(code);
+    let clean_code = extract_code_6(code);
+
+    if clean_code.len() != 6 {
+        return Err(format!("Invalid A-share code: {code}"));
+    }
+
+    let secid = eastmoney_secid(&clean_code);
     let beg = start_date.replace('-', "");
     let end = end_date.replace('-', "");
 
