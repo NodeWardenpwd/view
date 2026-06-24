@@ -76,7 +76,7 @@ pub fn tradingview_routes() -> Router<Arc<TradingViewState>> {
         .route("/canvas/load", get(canvas_load))
         .route("/canvas/save", post(canvas_save))
         .route("/canvas/delete", delete(canvas_delete))
-		.route("/auth/verify", get(verify_email))
+		.route("/auth/verify", axum::routing::get(verify_email))
 }
 
 // ============ AKTools Data Models ============
@@ -770,27 +770,31 @@ async fn canvas_delete(
 }
 
 
-use axum::{extract::Query, response::Json, serde::Deserialize};
-use std::env;
+// ============================================
+// 邮箱验证白名单专属接口（完美规避命名冲突版本）
+// ============================================
 
-#[derive(Deserialize)]
-struct VerifyParams {
-    email: String,
+#[derive(serde::Deserialize)]
+pub struct VerifyParams {
+    pub email: String,
 }
 
 #[derive(serde::Serialize)]
-struct VerifyResponse {
-    allowed: bool,
+pub struct VerifyResponse {
+    pub allowed: bool,
 }
 
-// 专门用来验证 Google 邮箱白名单的接口
-async fn verify_email(Query(params): Query<VerifyParams>) -> Json<VerifyResponse> {
+// 注意这里去掉了 use 声明，直接使用绝对路径指定 Axum 的 Query 和 Json
+pub async fn verify_email(
+    axum::extract::Query(params): axum::extract::Query<VerifyParams>
+) -> axum::response::Json<VerifyResponse> {
+    
     // 从 Hugging Face 的 Secrets 中读取配置的环境变量
-    // 如果没有配置，为了安全，默认不允许任何人登录
-    let allowed_email = env::var("ALLOWED_EMAIL").unwrap_or_else(|_| "".to_string());
+    let allowed_email = std::env::var("ALLOWED_EMAIL").unwrap_or_else(|_| "".to_string());
     
     // 比较前端传过来的邮箱和环境变量是否一致
-    let is_allowed = !allowed_email.is_empty() && params.email.trim().to_lowercase() == allowed_email.trim().to_lowercase();
+    let is_allowed = !allowed_email.is_empty() 
+        && params.email.trim().to_lowercase() == allowed_email.trim().to_lowercase();
     
-    Json(VerifyResponse { allowed: is_allowed })
+    axum::response::Json(VerifyResponse { allowed: is_allowed })
 }
