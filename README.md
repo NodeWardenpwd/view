@@ -1,19 +1,20 @@
 # 📊 View — A-Share Chart Platform v3.0
 
-[🇨🇳 中文版 README](README_CN.md) · [English README](README_EN.md)
+[🇨🇳 中文版 README](README_CN.md)
 
 > **v3.0 Architecture Upgrade**
 >
-> The project has been fully decentralized: **AKTools dependency removed**. It now runs on a **pure Rust backend** powered by **East Money public APIs**, with native support for intraday candles (1m/5m/15m/30m/60m), high-frequency polling pseudo-realtime quotes, and browser-disguised HTTP requests that bypass overseas IP anti-bot restrictions.
+> 项目已升级至 v3.0，移除所有 AKTools 依赖。全面改用腾讯财经高速免签 API 驱动，秒回数据。原生支持分钟线、日线、周线、月线全周期图表，且天然免疫海外 IP 风控限制。
 
-A self-hosted **A-share (China stock)** charting platform. A lightweight Rust Axum backend proxies East Money market data into the TradingView UDF protocol, paired with a professional Charting Library frontend.
+A self-hosted **A-share (China stock)** charting platform. A lightweight Rust Axum backend proxies **Tencent Finance** market data into the TradingView UDF protocol, paired with a professional Charting Library frontend.
 
 ## ✨ Features
 
 ### Market Data (v3.0)
-- **East Money K-line API** — Daily / weekly / monthly + intraday (1/5/15/30/60 min), forward-adjusted (qfq)
+- **Tencent Finance K-line API** — Intraday (1/5/15/30/60 min) + daily / weekly / monthly (qfq), all periods supported
+- **Tencent Finance quote API** — GBK-decoded real-time quotes via `qt.gtimg.cn` for correct Chinese stock names
 - **No local database required** — On-demand proxy; no TimescaleDB sync for chart data
-- **Anti-bot headers + retry** — Browser User-Agent / Referer disguise with 3-attempt retry for overseas deployments (e.g. Hugging Face)
+- **Browser headers + retry** — Chrome User-Agent with 3-attempt retry for stable overseas deployments (e.g. Hugging Face)
 - **Polling pseudo-realtime** — Frontend polls latest bars and watchlist quotes every 10–30 seconds
 
 ### Charting
@@ -32,7 +33,7 @@ tradingview/
 ├── backend/
 │   ├── src/
 │   │   ├── main.rs           # Axum server bootstrap
-│   │   └── tradingview.rs    # UDF API + East Money proxy
+│   │   └── tradingview.rs    # UDF API + Tencent Finance proxy
 │   └── .env.example
 └── frontend/
     ├── index.html            # Main chart app
@@ -45,8 +46,8 @@ tradingview/
 
 | Layer | Technology |
 |-------|-----------|
-| **Backend** | Rust, Axum, reqwest, tokio |
-| **Data Source** | East Money public HTTP APIs |
+| **Backend** | Rust, Axum, reqwest, tokio, encoding_rs |
+| **Data Source** | Tencent Finance public HTTP APIs |
 | **Frontend** | TradingView Charting Library, Vanilla JS |
 | **Auth** | Google Identity Services (OAuth) |
 

@@ -6,6 +6,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::{FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use encoding_rs::GBK;
 use futures::StreamExt;
 use log::{debug, error, info, warn};
 use reqwest::Client;
@@ -494,26 +495,30 @@ fn tencent_symbol(market: &str, clean_code: &str) -> String {
 }
 
 fn tencent_kline_url(market: &str, clean_code: &str, period: &str) -> Option<String> {
-    let symbol = tencent_symbol(market, clean_code);
     if matches!(period, "1" | "5" | "15" | "30" | "60") {
         Some(format!(
-            "{TENCENT_MINS_URL}?symbol={symbol}&type=m{period}"
-        ))
-    } else if matches!(period, "D" | "W" | "M") {
-        Some(format!(
-            "{TENCENT_KLINE_URL}?symbol={symbol}&type=qfq{}",
-            period.to_lowercase()
+            "{TENCENT_MINS_URL}?symbol={market}{clean_code}&type=m{period}"
         ))
     } else {
-        None
+        let tencent_type = match period {
+            "D" | "d" => "qfqday",
+            "W" | "w" => "qfqweek",
+            "M" | "m" => "qfqmonth",
+            _ => return None,
+        };
+        Some(format!(
+            "{TENCENT_KLINE_URL}?symbol={market}{clean_code}&type={tencent_type}"
+        ))
     }
 }
 
 fn tencent_data_key(period: &str) -> String {
-    if matches!(period, "1" | "5" | "15" | "30" | "60") {
-        format!("m{period}")
-    } else {
-        format!("qfq{}", period.to_lowercase())
+    match period {
+        "1" | "5" | "15" | "30" | "60" => format!("m{period}"),
+        "D" | "d" => "qfqday".to_string(),
+        "W" | "w" => "qfqweek".to_string(),
+        "M" | "m" => "qfqmonth".to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -638,15 +643,18 @@ async fn http_get_with_retry(client: &Client, url: &str, label: &str) -> Result<
     Err(last_err)
 }
 
-async fn http_get_text_with_retry(
+async fn http_get_gbk_text_with_retry(
     client: &Client,
     url: &str,
     label: &str,
 ) -> Result<String, String> {
     let resp = http_get_with_retry(client, url, label).await?;
-    resp.text()
+    let bytes = resp
+        .bytes()
         .await
-        .map_err(|e| format!("{label} response read failed: {e}"))
+        .map_err(|e| format!("{label} response read failed: {e}"))?;
+    let (decoded, _, _) = GBK.decode(&bytes);
+    Ok(decoded.into_owned())
 }
 
 fn parse_str_f64(value: &str) -> Option<f64> {
@@ -734,7 +742,7 @@ async fn fetch_tencent_quotes(
     let url = format!("{TENCENT_QT_URL}{}", qt_symbols.join(","));
     debug!("Tencent quote request: {}", url);
 
-    let Ok(body) = http_get_text_with_retry(&state.http, &url, "Tencent quote").await else {
+    let Ok(body) = http_get_gbk_text_with_retry(&state.http, &url, "Tencent quote").await else {
         return HashMap::new();
     };
 

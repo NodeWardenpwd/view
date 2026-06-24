@@ -1,17 +1,18 @@
 # 📊 View — A 股看盘平台 v3.0
 
-[🇺🇸 English README](README_EN.md) · [Main README](README.md)
+[🇺🇸 English README](README.md)
 
 > **v3.0 架构升级**
 >
-> 项目已升级至 **v3.0 版本**，架构全面去中心化，**移除 AKTools 依赖**。升级为 **纯净的 Rust 后端 + 东方财富公开高速 API** 驱动，完美支持分钟线（1m/5m/15m/30m/60m）及高频轮询伪实时行情，并通过浏览器伪装请求头与重试机制，有效穿透海外机房 IP 的风控限制。
+> 项目已升级至 v3.0，移除所有 AKTools 依赖。全面改用腾讯财经高速免签 API 驱动，秒回数据。原生支持分钟线、日线、周线、月线全周期图表，且天然免疫海外 IP 风控限制。
 
-自托管 **A 股** 看盘系统：Rust Axum 后端将东方财富行情动态代理为 TradingView UDF 协议，前端使用专业 Charting Library 渲染 K 线。
+自托管 **A 股** 看盘系统：Rust Axum 后端将腾讯财经行情动态代理为 TradingView UDF 协议，前端使用专业 Charting Library 渲染 K 线。
 
 ## ✨ 功能特性
 
 ### 行情数据（v3.0）
-- **东财 K 线接口** — 日/周/月 + 分钟线（1/5/15/30/60），前复权
+- **腾讯财经 K 线接口** — 日/周/月 + 分钟线（1/5/15/30/60），前复权（qfqday/qfqweek/qfqmonth）
+- **GBK 解码实时报价** — `qt.gtimg.cn` 接口正确显示中文股票名称
 - **无需本地数据库** — 按需动态拉取，无需 TimescaleDB 全量同步
 - **风控对抗** — 注入浏览器 User-Agent / Referer 等请求头，失败自动重试 3 次
 - **轮询伪实时** — 图表与自选股每 10–30 秒轮询最新报价
@@ -32,7 +33,7 @@ tradingview/
 ├── backend/
 │   ├── src/
 │   │   ├── main.rs           # Axum 服务入口
-│   │   └── tradingview.rs    # UDF API + 东财代理
+│   │   └── tradingview.rs    # UDF API + 腾讯财经代理
 │   └── .env.example
 └── frontend/
     ├── index.html            # 主看盘界面
@@ -46,7 +47,7 @@ tradingview/
 | 层级 | 技术 |
 |------|------|
 | **后端** | Rust, Axum, reqwest, tokio |
-| **数据源** | 东方财富公开 HTTP API |
+| **数据源** | 腾讯财经公开 HTTP API |
 | **前端** | TradingView Charting Library, Vanilla JS |
 | **认证** | Google Identity Services (OAuth) |
 
