@@ -382,7 +382,7 @@ async fn find_stock_entry(state: &TradingViewState, tv_symbol: &str) -> Option<S
         }
     }
 
-    Some(build_stock_entry(code, code))
+    Some(build_stock_entry(code.clone(), code))
 }
 
 async fn fetch_history_bars(
