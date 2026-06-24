@@ -1,53 +1,60 @@
 use axum::{
     Router,
     extract::{Query, State, WebSocketUpgrade, ws::{Message, WebSocket}},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
 };
-use chrono::{DateTime, FixedOffset, NaiveDate, TimeZone, Utc};
-use futures::{StreamExt};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use futures::{SinkExt, StreamExt};
 use log::{debug, error, info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::sync::RwLock;
 
-const DEFAULT_AKTOOLS_URL: &str = "https://vwpypm0t-kangupiaodeapi.hf.space";
 const SHANGHAI_OFFSET_SECS: i32 = 8 * 3600;
+const SUPPORTED_RESOLUTIONS: &[&str] = &["1", "5", "15", "30", "60", "D", "W", "M"];
+const EASTMONEY_KLINE_URL: &str = "https://push2his.eastmoney.com/api/qt/stock/kline/get";
+const EASTMONEY_QUOTE_URL: &str = "https://push2.eastmoney.com/api/qt/ulist.np/get";
+const EASTMONEY_LIST_URL: &str = "https://push2.eastmoney.com/api/qt/clist/get";
 
 pub struct TradingViewState {
     pub http: Client,
-    pub aktools_url: String,
     pub symbol_cache: Arc<RwLock<Vec<StockEntry>>>,
 }
 
 #[derive(Clone, Debug)]
-pub struct StockEntry {
+struct StockEntry {
     code: String,
     name: String,
     exchange: String,
     tv_symbol: String,
 }
 
+#[derive(Debug, Clone)]
+struct StockBar {
+    date: String,
+    open: f64,
+    close: f64,
+    high: f64,
+    low: f64,
+    volume: f64,
+}
+
 impl TradingViewState {
     pub fn new() -> Self {
-        let aktools_url = std::env::var("AKTOOLS_URL")
-            .unwrap_or_else(|_| DEFAULT_AKTOOLS_URL.to_string())
-            .trim_end_matches('/')
-            .to_string();
-
-        info!("AKTools proxy base URL: {}", aktools_url);
-
+        info!("TradingView UDF proxy initialized (East Money data source)");
         Self {
             http: Client::builder()
                 .timeout(std::time::Duration::from_secs(60))
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
                 .build()
                 .expect("Failed to build HTTP client"),
-            aktools_url,
             symbol_cache: Arc::new(RwLock::new(Vec::new())),
         }
     }
@@ -70,51 +77,14 @@ pub fn tradingview_routes() -> Router<Arc<TradingViewState>> {
         .route("/search", get(search_symbols))
         .route("/tracked-symbols", get(get_tracked_symbols))
         .route("/daily-opens", get(get_daily_opens))
+        .route("/quotes", get(get_quotes))
         .route("/history", get(get_history))
         .route("/ws", get(ws_handler))
         .route("/canvas/list", get(canvas_list))
         .route("/canvas/load", get(canvas_load))
         .route("/canvas/save", post(canvas_save))
         .route("/canvas/delete", delete(canvas_delete))
-		.route("/auth/verify", axum::routing::get(verify_email))
-}
-
-// ============ AKTools Data Models ============
-
-#[derive(Debug, Deserialize)]
-struct AkStockBar {
-    #[serde(alias = "日期")]
-    date: String,
-    #[serde(alias = "开盘")]
-    open: f64,
-    #[serde(alias = "收盘")]
-    close: f64,
-    #[serde(alias = "最高")]
-    high: f64,
-    #[serde(alias = "最低")]
-    low: f64,
-    #[serde(alias = "成交量")]
-    volume: f64,
-}
-
-#[derive(Debug, Deserialize)]
-struct AkStockNameRow {
-    #[serde(alias = "code")]
-    code: Option<String>,
-    #[serde(alias = "name")]
-    name: Option<String>,
-    #[serde(alias = "代码")]
-    code_cn: Option<String>,
-    #[serde(alias = "名称")]
-    name_cn: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct AkSpotRow {
-    #[serde(alias = "代码")]
-    code: Option<String>,
-    #[serde(alias = "今开")]
-    open: Option<f64>,
+        .route("/auth/verify", get(verify_email))
 }
 
 // ============ UDF Response Types ============
@@ -189,18 +159,23 @@ enum UdfHistoryResponse {
     },
 }
 
+#[derive(Serialize)]
+struct QuoteItem {
+    symbol: String,
+    last: f64,
+    change: f64,
+    change_percent: f64,
+    open: f64,
+}
+
 #[derive(Deserialize)]
 struct SymbolQuery {
     symbol: String,
 }
 
 #[derive(Deserialize)]
-#[allow(dead_code)]
 struct SearchQuery {
     query: Option<String>,
-    #[serde(rename = "type")]
-    symbol_type: Option<String>,
-    exchange: Option<String>,
     limit: Option<i32>,
 }
 
@@ -211,7 +186,189 @@ struct HistoryQuery {
     from: i64,
     to: i64,
     countback: Option<i64>,
-	user_email: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct QuotesQuery {
+    symbols: String,
+}
+
+#[derive(Deserialize)]
+pub struct VerifyParams {
+    pub email: String,
+}
+
+#[derive(Serialize)]
+pub struct VerifyResponse {
+    pub allowed: bool,
+}
+
+// ============ Auth Whitelist ============
+
+pub fn check_email_allowed(email: &str) -> bool {
+    if std::env::var("AUTH_DISABLED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+    {
+        return true;
+    }
+
+    let email = email.trim().to_lowercase();
+    if email.is_empty() {
+        return false;
+    }
+
+    if let Ok(list) = std::env::var("ALLOWED_EMAILS") {
+        for allowed in list.split(',') {
+            if allowed.trim().to_lowercase() == email {
+                return true;
+            }
+        }
+    }
+
+    if let Ok(single) = std::env::var("ALLOWED_EMAIL") {
+        if !single.trim().is_empty() && single.trim().to_lowercase() == email {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn extract_email_from_request(headers: &HeaderMap) -> Option<String> {
+    if let Some(cookie_header) = headers.get("cookie") {
+        if let Ok(cookies) = cookie_header.to_str() {
+            for part in cookies.split(';') {
+                let part = part.trim();
+                if let Some(raw) = part.strip_prefix("logged_in_email=") {
+                    let email = url_decode(raw);
+                    if !email.is_empty() {
+                        return Some(email);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(value) = headers.get("x-user-email").and_then(|v| v.to_str().ok()) {
+        if !value.trim().is_empty() {
+            return Some(value.trim().to_string());
+        }
+    }
+
+    if let Some(auth) = headers.get("authorization").and_then(|v| v.to_str().ok()) {
+        if let Some(token) = auth.strip_prefix("Bearer ") {
+            if let Some(email) = email_from_jwt(token.trim()) {
+                return Some(email);
+            }
+        }
+    }
+
+    None
+}
+
+fn url_decode(input: &str) -> String {
+    let mut out = String::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                out.push(byte as char);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+fn email_from_jwt(token: &str) -> Option<String> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let mut b64 = payload_b64.replace('-', "+").replace('_', "/");
+    while b64.len() % 4 != 0 {
+        b64.push('=');
+    }
+    let bytes = base64_decode(&b64).ok()?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    json.get("email")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
+    const TABLE: &[u8; 128] = &{
+        let mut table = [255u8; 128];
+        let mut i = 0u8;
+        while i < 26 {
+            table[(b'A' + i) as usize] = i;
+            table[(b'a' + i) as usize] = i + 26;
+            i += 1;
+        }
+        let mut d = 0u8;
+        while d < 10 {
+            table[(b'0' + d) as usize] = d + 52;
+            d += 1;
+        }
+        table[b'+' as usize] = 62;
+        table[b'/' as usize] = 63;
+        table
+    };
+
+    let input = input.as_bytes();
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+
+    for &byte in input {
+        if byte == b'=' {
+            break;
+        }
+        let val = if (byte as usize) < 128 {
+            TABLE[byte as usize]
+        } else {
+            255
+        };
+        if val == 255 {
+            continue;
+        }
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+
+    if out.is_empty() {
+        Err(())
+    } else {
+        Ok(out)
+    }
+}
+
+fn ensure_authorized(headers: &HeaderMap) -> Result<(), Response> {
+    if std::env::var("AUTH_DISABLED")
+        .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+
+    match extract_email_from_request(headers) {
+        Some(email) if check_email_allowed(&email) => Ok(()),
+        _ => Err(StatusCode::UNAUTHORIZED.into_response()),
+    }
+}
+
+fn unauthorized_history() -> Json<UdfHistoryResponse> {
+    Json(UdfHistoryResponse::Error {
+        s: "error".to_string(),
+        errmsg: "Unauthorized Account".to_string(),
+    })
 }
 
 // ============ Symbol Helpers ============
@@ -249,6 +406,14 @@ fn exchange_for_code(code: &str) -> (&'static str, &'static str) {
     }
 }
 
+fn eastmoney_secid(code: &str) -> String {
+    if code.starts_with('6') {
+        format!("1.{code}")
+    } else {
+        format!("0.{code}")
+    }
+}
+
 fn build_stock_entry(code: String, name: String) -> StockEntry {
     let (exchange, prefix) = exchange_for_code(&code);
     StockEntry {
@@ -260,15 +425,26 @@ fn build_stock_entry(code: String, name: String) -> StockEntry {
 }
 
 fn unix_to_yyyymmdd(ts: i64) -> String {
-    let dt = DateTime::<Utc>::from_timestamp(ts, 0).unwrap_or_else(Utc::now);
-    dt.format("%Y%m%d").to_string()
+    DateTime::<Utc>::from_timestamp(ts, 0)
+        .unwrap_or_else(Utc::now)
+        .format("%Y%m%d")
+        .to_string()
 }
 
 fn parse_bar_timestamp(date_str: &str) -> Option<i64> {
-    let date_part = date_str.split('T').next()?.trim();
+    let value = date_str.trim();
+    let shanghai = FixedOffset::east_opt(SHANGHAI_OFFSET_SECS)?;
+
+    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M") {
+        return shanghai
+            .from_local_datetime(&dt)
+            .single()
+            .map(|dt| dt.timestamp());
+    }
+
+    let date_part = value.split('T').next()?.trim();
 
     if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
-        let shanghai = FixedOffset::east_opt(SHANGHAI_OFFSET_SECS)?;
         return shanghai
             .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
             .single()
@@ -277,7 +453,6 @@ fn parse_bar_timestamp(date_str: &str) -> Option<i64> {
 
     if date_part.len() == 8 && date_part.chars().all(|c| c.is_ascii_digit()) {
         if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
-            let shanghai = FixedOffset::east_opt(SHANGHAI_OFFSET_SECS)?;
             return shanghai
                 .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
                 .single()
@@ -288,11 +463,16 @@ fn parse_bar_timestamp(date_str: &str) -> Option<i64> {
     None
 }
 
-fn resolution_to_period(resolution: &str) -> Option<&'static str> {
+fn resolution_to_klt(resolution: &str) -> Option<u32> {
     match resolution {
-        "D" | "1D" => Some("daily"),
-        "W" | "1W" => Some("weekly"),
-        "M" | "1M" => Some("monthly"),
+        "1" => Some(1),
+        "5" => Some(5),
+        "15" => Some(15),
+        "30" => Some(30),
+        "60" => Some(60),
+        "D" | "1D" => Some(101),
+        "W" | "1W" => Some(102),
+        "M" | "1M" => Some(103),
         _ => None,
     }
 }
@@ -320,12 +500,27 @@ fn build_symbol_info(tv_symbol: &str, name: Option<String>) -> UdfSymbolInfo {
         minmovement2: 0,
         minmov2: 0,
         pricescale: 100,
-        supported_resolutions: vec!["1D", "1W", "1M"],
-        has_intraday: false,
+        supported_resolutions: SUPPORTED_RESOLUTIONS.to_vec(),
+        has_intraday: true,
         has_daily: true,
         has_weekly_and_monthly: true,
-        data_status: "endofday".to_string(),
+        data_status: "streaming".to_string(),
     }
+}
+
+fn parse_eastmoney_kline(line: &str) -> Option<StockBar> {
+    let parts: Vec<&str> = line.split(',').collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    Some(StockBar {
+        date: parts[0].to_string(),
+        open: parts[1].parse().unwrap_or(0.0),
+        close: parts[2].parse().unwrap_or(0.0),
+        high: parts[3].parse().unwrap_or(0.0),
+        low: parts[4].parse().unwrap_or(0.0),
+        volume: parts[5].parse().unwrap_or(0.0),
+    })
 }
 
 async fn load_symbol_directory(state: &TradingViewState) -> Result<Vec<StockEntry>, String> {
@@ -336,30 +531,35 @@ async fn load_symbol_directory(state: &TradingViewState) -> Result<Vec<StockEntr
         }
     }
 
-    let url = format!("{}/api/public/stock_info_a_code_name", state.aktools_url);
+    let url = format!(
+        "{EASTMONEY_LIST_URL}?pn=1&pz=5000&po=1&np=1&fltt=2&invt=2&fid=f12&fs=m:0+t:6,m:0+t:80,m:1+t:2,m:1+t:23&fields=f12,f14"
+    );
+
     let resp = state
         .http
         .get(&url)
         .send()
         .await
-        .map_err(|e| format!("AKTools symbol list request failed: {e}"))?;
+        .map_err(|e| format!("EastMoney symbol list request failed: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("AKTools symbol list HTTP {}", resp.status()));
+        return Err(format!("EastMoney symbol list HTTP {}", resp.status()));
     }
 
-    let rows: Vec<AkStockNameRow> = resp
+    let json: serde_json::Value = resp
         .json()
         .await
-        .map_err(|e| format!("Failed to parse AKTools symbol list: {e}"))?;
+        .map_err(|e| format!("Failed to parse EastMoney symbol list: {e}"))?;
 
-    let entries: Vec<StockEntry> = rows
-        .into_iter()
+    let entries: Vec<StockEntry> = json["data"]["diff"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
         .filter_map(|row| {
-            let code = row.code.or(row.code_cn)?;
-            let name = row.name.or(row.name_cn)?;
+            let code = row["f12"].as_str()?.trim();
+            let name = row["f14"].as_str()?.trim();
             if code.len() == 6 {
-                Some(build_stock_entry(code, name))
+                Some(build_stock_entry(code.to_string(), name.to_string()))
             } else {
                 None
             }
@@ -371,56 +571,39 @@ async fn load_symbol_directory(state: &TradingViewState) -> Result<Vec<StockEntr
         *cache = entries.clone();
     }
 
-    info!("Loaded {} A-share symbols from AKTools", entries.len());
+    info!("Loaded {} A-share symbols from East Money", entries.len());
     Ok(entries)
 }
 
-async fn find_stock_entry(state: &TradingViewState, tv_symbol: &str) -> Option<StockEntry> {
+async fn find_stock_entry(state: &TradingViewState, tv_symbol: &str) -> StockEntry {
     let normalized = normalize_tv_symbol(tv_symbol);
     let code = extract_code_6(&normalized);
 
     if let Ok(entries) = load_symbol_directory(state).await {
         if let Some(entry) = entries.iter().find(|e| e.code == code) {
-            return Some(entry.clone());
+            return entry.clone();
         }
     }
 
-    Some(build_stock_entry(code.clone(), code))
+    build_stock_entry(code.clone(), code)
 }
 
 async fn fetch_history_bars(
     state: &TradingViewState,
     code: &str,
-    period: &str,
+    klt: u32,
     start_date: &str,
     end_date: &str,
-) -> Result<Vec<AkStockBar>, String> {
-    // 1. 判定沪深市场前缀 (带上结尾的分号)
-    let secid = if code.starts_with('6') {
-        format!("1.{}", code)
-    } else {
-        format!("0.{}", code)
-    };
+) -> Result<Vec<StockBar>, String> {
+    let secid = eastmoney_secid(code);
+    let beg = start_date.replace('-', "");
+    let end = end_date.replace('-', "");
 
-    // 将日期格式转换为东财识别格式
-    let formatted_start = if start_date.len() == 8 {
-        format!("{}-{}-{}", &start_date[0..4], &start_date[4..6], &start_date[6..8])
-    } else {
-        start_date.to_string()
-    };
-    let formatted_end = if end_date.len() == 8 {
-        format!("{}-{}-{}", &end_date[0..4], &end_date[4..6], &end_date[6..8])
-    } else {
-        end_date.to_string()
-    };
-
-    // 2. 直接向东财官方接口要数据 (完美避开国外 IP 对新浪财经的封锁)
     let url = format!(
-        "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid={}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56&klt=101&fqt=1&beg={}&end={}",
-        secid,
-        formatted_start.replace("-", ""),
-        formatted_end.replace("-", "")
+        "{EASTMONEY_KLINE_URL}?secid={secid}&fields1=f1,f2,f3,f4,f5,f6&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61&klt={klt}&fqt=1&beg={beg}&end={end}"
     );
+
+    debug!("EastMoney kline request: {}", url);
 
     let resp = state
         .http
@@ -429,60 +612,100 @@ async fn fetch_history_bars(
         .await
         .map_err(|e| format!("EastMoney request failed: {e}"))?;
 
-    if resp.status().is_success() {
-        if let Ok(json_data) = resp.json::<serde_json::Value>().await {
-            if let Some(klines) = json_data["data"]["klines"].as_array() {
-                let mut bars = Vec::new();
-                for k in klines {
-                    if let Some(k_str) = k.as_str() {
-                        let parts: Vec<&str> = k_str.split(',').collect();
-                        if parts.len() >= 6 {
-                            bars.push(AkStockBar {
-                                date: parts[0].to_string(),
-                                open: parts[1].parse().unwrap_or(0.0),
-                                close: parts[2].parse().unwrap_or(0.0),
-                                high: parts[3].parse().unwrap_or(0.0),
-                                low: parts[4].parse().unwrap_or(0.0),
-                                volume: parts[5].parse().unwrap_or(0.0),
-                            });
-                        }
-                    }
-                }
-                if !bars.is_empty() {
-                    return Ok(bars);
-                }
+    if !resp.status().is_success() {
+        return Err(format!("EastMoney HTTP {}", resp.status()));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse EastMoney JSON: {e}"))?;
+
+    let klines = json["data"]["klines"]
+        .as_array()
+        .ok_or_else(|| "EastMoney response missing data.klines".to_string())?;
+
+    let bars: Vec<StockBar> = klines
+        .iter()
+        .filter_map(|item| item.as_str())
+        .filter_map(parse_eastmoney_kline)
+        .collect();
+
+    if bars.is_empty() {
+        return Err("EastMoney returned empty klines".to_string());
+    }
+
+    Ok(bars)
+}
+
+async fn fetch_quotes(
+    state: &TradingViewState,
+    tv_symbols: &[String],
+) -> HashMap<String, QuoteItem> {
+    if tv_symbols.is_empty() {
+        return HashMap::new();
+    }
+
+    let secids: Vec<String> = tv_symbols
+        .iter()
+        .map(|symbol| eastmoney_secid(&extract_code_6(symbol)))
+        .collect();
+
+    let url = format!(
+        "{EASTMONEY_QUOTE_URL}?fltt=2&fields=f2,f3,f4,f46,f12,f14&secids={}",
+        secids.join(",")
+    );
+
+    let mut result = HashMap::new();
+
+    let Ok(resp) = state.http.get(&url).send().await else {
+        return result;
+    };
+    if !resp.status().is_success() {
+        return result;
+    }
+    let Ok(json) = resp.json::<serde_json::Value>().await else {
+        return result;
+    };
+
+    if let Some(items) = json["data"]["diff"].as_array().or_else(|| json["data"]["full"].as_array()) {
+        for item in items {
+            let code = item["f12"].as_str().unwrap_or_default();
+            if code.len() != 6 {
+                continue;
             }
+            let tv_symbol = normalize_tv_symbol(code);
+            let last = item["f2"].as_f64().unwrap_or(0.0);
+            let change_percent = item["f3"].as_f64().unwrap_or(0.0);
+            let change = item["f4"].as_f64().unwrap_or(0.0);
+            let open = item["f46"].as_f64().unwrap_or(last - change);
+            result.insert(
+                tv_symbol.clone(),
+                QuoteItem {
+                    symbol: tv_symbol,
+                    last,
+                    change,
+                    change_percent,
+                    open,
+                },
+            );
         }
     }
 
-    // 3. 如果东财失败，退回到原始 AKTools
-    let fallback_url = format!(
-        "{}/api/public/stock_zh_a_hist?symbol={code}&period={period}&start_date={start_date}&end_date={end_date}&adjust=qfq",
-        state.aktools_url
-    );
-
-    let resp = state
-        .http
-        .get(&fallback_url)
-        .send()
-        .await
-        .map_err(|e| format!("AKTools fallback failed: {e}"))?;
-
-    resp.json::<Vec<AkStockBar>>()
-        .await
-        .map_err(|e| format!("Failed to parse history JSON: {e}"))
+    result
 }
 
 // ============ Handlers ============
 
-async fn get_config() -> Json<UdfConfig> {
-    Json(UdfConfig {
-        supported_resolutions: vec!["1D", "1W", "1M"],
+async fn get_config(headers: HeaderMap) -> Result<Json<UdfConfig>, Response> {
+    ensure_authorized(&headers)?;
+    Ok(Json(UdfConfig {
+        supported_resolutions: SUPPORTED_RESOLUTIONS.to_vec(),
         supports_group_request: false,
         supports_marks: false,
         supports_search: true,
         supports_timescale_marks: false,
-    })
+    }))
 }
 
 async fn get_time() -> String {
@@ -494,15 +717,16 @@ async fn get_time() -> String {
 }
 
 async fn get_symbol_info(
+    headers: HeaderMap,
     State(state): State<Arc<TradingViewState>>,
     Query(query): Query<SymbolQuery>,
-) -> Json<UdfSymbolInfo> {
+) -> Result<Json<UdfSymbolInfo>, Response> {
+    ensure_authorized(&headers)?;
     let entry = find_stock_entry(&state, &query.symbol).await;
-    let info = match entry {
-        Some(e) => build_symbol_info(&e.tv_symbol, Some(e.name)),
-        None => build_symbol_info(&query.symbol, None),
-    };
-    Json(info)
+    Ok(Json(build_symbol_info(
+        &entry.tv_symbol,
+        Some(entry.name),
+    )))
 }
 
 async fn get_tracked_symbols() -> Json<Vec<String>> {
@@ -511,33 +735,36 @@ async fn get_tracked_symbols() -> Json<Vec<String>> {
 
 async fn get_daily_opens(
     State(state): State<Arc<TradingViewState>>,
-) -> Json<std::collections::HashMap<String, f64>> {
-    let mut opens = std::collections::HashMap::new();
+) -> Json<HashMap<String, f64>> {
     let symbols = TradingViewState::get_tracked_symbols_from_env();
-
-    let url = format!("{}/api/public/stock_zh_a_spot_em", state.aktools_url);
-    if let Ok(resp) = state.http.get(&url).send().await {
-        if resp.status().is_success() {
-            if let Ok(rows) = resp.json::<Vec<AkSpotRow>>().await {
-                for row in rows {
-                    if let (Some(code), Some(open)) = (row.code, row.open) {
-                        let tv_symbol = normalize_tv_symbol(&code);
-                        if symbols.contains(&tv_symbol) {
-                            opens.insert(tv_symbol, open);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
+    let quotes = fetch_quotes(&state, &symbols).await;
+    let opens = quotes
+        .into_iter()
+        .map(|(symbol, quote)| (symbol, quote.open))
+        .collect();
     Json(opens)
 }
 
+async fn get_quotes(
+    State(state): State<Arc<TradingViewState>>,
+    Query(query): Query<QuotesQuery>,
+) -> Json<HashMap<String, QuoteItem>> {
+    let symbols: Vec<String> = query
+        .symbols
+        .split(',')
+        .map(|s| normalize_tv_symbol(s.trim()))
+        .filter(|s| !s.is_empty())
+        .collect();
+    Json(fetch_quotes(&state, &symbols).await)
+}
+
 async fn search_symbols(
+    headers: HeaderMap,
     State(state): State<Arc<TradingViewState>>,
     Query(query): Query<SearchQuery>,
-) -> Json<Vec<UdfSearchResult>> {
+) -> Result<Json<Vec<UdfSearchResult>>, Response> {
+    ensure_authorized(&headers)?;
+
     let search_term = query.query.unwrap_or_default().to_lowercase();
     let limit = query.limit.unwrap_or(30).max(1) as usize;
 
@@ -558,10 +785,8 @@ async fn search_symbols(
     let results: Vec<UdfSearchResult> = entries
         .into_iter()
         .filter(|entry| {
-            if search_term.is_empty() {
-                return true;
-            }
-            entry.code.contains(&search_term)
+            search_term.is_empty()
+                || entry.code.contains(&search_term)
                 || entry.name.to_lowercase().contains(&search_term)
                 || entry.tv_symbol.contains(&search_term)
         })
@@ -576,38 +801,42 @@ async fn search_symbols(
         })
         .collect();
 
-    Json(results)
+    Ok(Json(results))
 }
 
 async fn get_history(
+    headers: HeaderMap,
     State(state): State<Arc<TradingViewState>>,
     Query(query): Query<HistoryQuery>,
-) -> Json<UdfHistoryResponse> {
-    
-    let period = match resolution_to_period(&query.resolution) {
-        Some(p) => p,
+) -> Result<Json<UdfHistoryResponse>, Response> {
+    if ensure_authorized(&headers).is_err() {
+        return Ok(unauthorized_history());
+    }
+
+    let klt = match resolution_to_klt(&query.resolution) {
+        Some(klt) => klt,
         None => {
-            return Json(UdfHistoryResponse::NoData {
+            return Ok(Json(UdfHistoryResponse::NoData {
                 s: "no_data".to_string(),
                 next_time: None,
-            });
+            }));
         }
     };
 
     let code = extract_code_6(&query.symbol);
     if code.len() != 6 {
-        return Json(UdfHistoryResponse::Error {
+        return Ok(Json(UdfHistoryResponse::Error {
             s: "error".to_string(),
             errmsg: format!("Invalid A-share symbol: {}", query.symbol),
-        });
+        }));
     }
 
     let start_date = unix_to_yyyymmdd(query.from);
     let end_date = unix_to_yyyymmdd(query.to);
 
-    match fetch_history_bars(&state, &code, period, &start_date, &end_date).await {
+    match fetch_history_bars(&state, &code, klt, &start_date, &end_date).await {
         Ok(bars) => {
-            let mut parsed: Vec<(i64, &AkStockBar)> = bars
+            let mut parsed: Vec<(i64, &StockBar)> = bars
                 .iter()
                 .filter_map(|bar| parse_bar_timestamp(&bar.date).map(|ts| (ts, bar)))
                 .filter(|(ts, _)| *ts >= query.from && *ts <= query.to)
@@ -622,10 +851,10 @@ async fn get_history(
             }
 
             if parsed.is_empty() {
-                return Json(UdfHistoryResponse::NoData {
+                return Ok(Json(UdfHistoryResponse::NoData {
                     s: "no_data".to_string(),
                     next_time: None,
-                });
+                }));
             }
 
             let mut t = Vec::with_capacity(parsed.len());
@@ -644,7 +873,7 @@ async fn get_history(
                 v.push(bar.volume);
             }
 
-            Json(UdfHistoryResponse::Ok {
+            Ok(Json(UdfHistoryResponse::Ok {
                 s: "ok".to_string(),
                 t,
                 o,
@@ -652,43 +881,39 @@ async fn get_history(
                 l,
                 c,
                 v,
-            })
+            }))
         }
-        Err(e) => Json(UdfHistoryResponse::Error {
+        Err(e) => Ok(Json(UdfHistoryResponse::Error {
             s: "error".to_string(),
             errmsg: e,
-        }),
+        })),
     }
 }
 
-// ============ WebSocket Handler (kept for frontend compatibility) ============
+pub async fn verify_email(Query(params): Query<VerifyParams>) -> Json<VerifyResponse> {
+    Json(VerifyResponse {
+        allowed: check_email_allowed(&params.email),
+    })
+}
+
+// ============ WebSocket Handler ============
 
 async fn ws_handler(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(handle_ws_connection)
 }
 
 async fn handle_ws_connection(mut socket: WebSocket) {
-    info!("WebSocket client connected (A-share proxy mode: no live stream)");
+    info!("WebSocket client connected (polling mode recommended)");
 
     while let Some(msg) = socket.next().await {
         match msg {
-            Ok(Message::Text(text)) => {
-                if text.contains("\"ping\"") || text.contains("Ping") {
-                    let _ = socket
-                        .send(Message::Text(r#"{"type":"pong"}"#.into()))
-                        .await;
-                }
+            Ok(Message::Text(text)) if text.contains("ping") || text.contains("Ping") => {
+                let _ = socket.send(Message::Text(r#"{"type":"pong"}"#.into())).await;
             }
-            Ok(Message::Close(_)) => break,
-            Err(e) => {
-                warn!("WebSocket receive error: {}", e);
-                break;
-            }
+            Ok(Message::Close(_)) | Err(_) => break,
             _ => {}
         }
     }
-
-    info!("WebSocket connection closed");
 }
 
 // ============ Canvas API ============
@@ -725,13 +950,16 @@ struct CanvasListResponse {
     canvases: Vec<String>,
 }
 
-fn get_user_id(headers: &axum::http::HeaderMap) -> String {
-    headers
-        .get("X-User-Id")
-        .and_then(|v| v.to_str().ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_USER)
-        .to_string()
+fn get_user_id(headers: &HeaderMap) -> String {
+    extract_email_from_request(headers)
+        .or_else(|| {
+            headers
+                .get("X-User-Id")
+                .and_then(|v| v.to_str().ok())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| DEFAULT_USER.to_string())
 }
 
 fn get_canvas_dir(user_id: &str, symbol: &str) -> PathBuf {
@@ -745,7 +973,7 @@ fn get_canvas_path(user_id: &str, symbol: &str, name: &str) -> PathBuf {
 }
 
 async fn canvas_list(
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Query(query): Query<CanvasListQuery>,
 ) -> Json<CanvasListResponse> {
     let user_id = get_user_id(&headers);
@@ -767,7 +995,7 @@ async fn canvas_list(
 }
 
 async fn canvas_load(
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Query(query): Query<CanvasLoadQuery>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
     let user_id = get_user_id(&headers);
@@ -786,7 +1014,7 @@ async fn canvas_load(
 }
 
 async fn canvas_save(
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Json(body): Json<CanvasSaveBody>,
 ) -> Result<StatusCode, StatusCode> {
     let user_id = get_user_id(&headers);
@@ -811,7 +1039,7 @@ async fn canvas_save(
 }
 
 async fn canvas_delete(
-    headers: axum::http::HeaderMap,
+    headers: HeaderMap,
     Query(query): Query<CanvasDeleteQuery>,
 ) -> StatusCode {
     let user_id = get_user_id(&headers);
@@ -824,36 +1052,4 @@ async fn canvas_delete(
         }
         Err(_) => StatusCode::NOT_FOUND,
     }
-}
-
-
-// ============================================
-// 邮箱验证白名单专属接口（完美规避命名冲突版本）
-// ============================================
-
-#[derive(serde::Deserialize)]
-pub struct VerifyParams {
-    pub email: String,
-}
-
-#[derive(serde::Serialize)]
-pub struct VerifyResponse {
-    pub allowed: bool,
-}
-
-// 提取出来的公共核心拦截函数
-pub fn check_email_allowed(email: &str) -> bool {
-    let allowed_email = std::env::var("ALLOWED_EMAIL").unwrap_or_else(|_| "".to_string());
-    if allowed_email.is_empty() {
-        return false;
-    }
-    email.trim().to_lowercase() == allowed_email.trim().to_lowercase()
-}
-
-// 原有的验证接口，保持给前端调用
-pub async fn verify_email(
-    axum::extract::Query(params): axum::extract::Query<VerifyParams>
-) -> axum::response::Json<VerifyResponse> {
-    let is_allowed = check_email_allowed(&params.email);
-    axum::response::Json(VerifyResponse { allowed: is_allowed })
 }

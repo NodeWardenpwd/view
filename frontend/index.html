@@ -8,7 +8,7 @@
     <link rel="icon" type="image/png" href="https://img.cathiefish.art/tradingview/icon2.jpg">
     <link rel="apple-touch-icon" href="https://img.cathiefish.art/tradingview/icon2.jpg">
     <!-- Config -->
-    <script src="auth-config.js?v=2"></script>
+    <script src="auth-config.js?v=3"></script>
     <style>
         :root {
             --tv-color-platform-background: #131722;
@@ -1092,20 +1092,44 @@
 
         // ============ API URL Helper ============
         function getApiBaseUrl() {
-            // Use configured URL if available
             if (window.API_CONFIG && window.API_CONFIG.baseUrl) {
-                console.log('Using configured API URL:', window.API_CONFIG.baseUrl);
-                return window.API_CONFIG.baseUrl;
+                const base = String(window.API_CONFIG.baseUrl).replace(/\/$/, '');
+                if (base.startsWith('http://') || base.startsWith('https://')) {
+                    return base;
+                }
+                if (base.startsWith('/')) {
+                    return `${window.location.origin}${base}`;
+                }
+                return `${window.location.origin}/${base}`;
             }
-            // Handle file:// protocol or empty host
             if (window.location.protocol === 'file:' || !window.location.host) {
-                console.log('Using default localhost:3000');
                 return 'http://localhost:3000';
             }
-            // Default: use current page location
-            const url = `${window.location.protocol}//${window.location.host}`;
-            console.log('Using page location as API URL:', url);
-            return url;
+            return window.location.origin;
+        }
+
+        function getDatafeedFetchInit() {
+            const init = { credentials: 'same-origin' };
+            const token = localStorage.getItem('auth_token');
+            if (token) {
+                init.headers = { Authorization: `Bearer ${token}` };
+            }
+            return init;
+        }
+
+        function syncSessionCookie() {
+            const email = localStorage.getItem('logged_in_email')
+                || (() => {
+                    try {
+                        const user = JSON.parse(localStorage.getItem('auth_user') || 'null');
+                        return user?.email || '';
+                    } catch (e) {
+                        return '';
+                    }
+                })();
+            if (email) {
+                document.cookie = `logged_in_email=${encodeURIComponent(email)}; path=/; max-age=${144 * 60 * 60}; SameSite=Lax`;
+            }
         }
 
         function getWebSocketUrl() {
@@ -1288,7 +1312,7 @@
         // ============ Fetch Supported Symbols from Backend ============
         async function fetchSupportedSymbols() {
             try {
-                const res = await fetch(`${getApiBaseUrl()}/tracked-symbols`);
+                const res = await fetch(`${getApiBaseUrl()}/tracked-symbols`, getDatafeedFetchInit());
                 if (res.ok) {
                     const symbols = await res.json();
                     return symbols.map(symbol => ({
@@ -1307,7 +1331,7 @@
 
         async function fetchDailyOpens() {
             try {
-                const res = await fetch(`${getApiBaseUrl()}/daily-opens`);
+                const res = await fetch(`${getApiBaseUrl()}/daily-opens`, getDatafeedFetchInit());
                 if (res.ok) {
                     dailyOpenPrices = await res.json();
                 }
@@ -1316,7 +1340,45 @@
             }
         }
 
-        // ============ Watchlist Manager ============
+        let quotePollTimer = null;
+
+        async function pollWatchlistQuotes() {
+            if (!watchlistManager) return;
+            const symbols = new Set();
+            Object.values(watchlistManager.lists).forEach(list => {
+                list.forEach(item => symbols.add(item.symbol));
+            });
+            if (symbols.size === 0) return;
+
+            try {
+                const res = await fetch(
+                    `${getApiBaseUrl()}/quotes?symbols=${encodeURIComponent([...symbols].join(','))}`,
+                    getDatafeedFetchInit()
+                );
+                if (!res.ok) return;
+                const quotes = await res.json();
+                Object.entries(quotes).forEach(([symbol, quote]) => {
+                    const lists = Object.values(watchlistManager.lists);
+                    lists.forEach(list => {
+                        const item = list.find(i => i.symbol.toUpperCase() === symbol.toUpperCase());
+                        if (!item) return;
+                        item.last = quote.last;
+                        item.change = quote.change;
+                        item.changePercent = quote.change_percent;
+                    });
+                });
+                watchlistManager.render();
+            } catch (e) {
+                console.warn('Quote poll failed:', e);
+            }
+        }
+
+        function startQuotePolling() {
+            if (quotePollTimer) clearInterval(quotePollTimer);
+            pollWatchlistQuotes();
+            quotePollTimer = setInterval(pollWatchlistQuotes, 10000);
+        }
+
         class WatchlistManager {
             constructor() {
                 this.STORAGE_KEY = 'watchlist_data';
@@ -1651,48 +1713,64 @@
 
         // ============ Custom Datafeed ============
         class CustomDatafeed {
-            constructor(url) { this.url = url; }
+            constructor(url) {
+                this.url = String(url).replace(/\/$/, '');
+                this.subscriptions = {};
+                this._pollTimers = {};
+            }
+
+            _fetchJson(path) {
+                return fetch(`${this.url}${path}`, getDatafeedFetchInit()).then(async (r) => {
+                    if (r.status === 401) {
+                        throw new Error('Unauthorized Account');
+                    }
+                    return r.json();
+                });
+            }
 
             onReady(cb) {
-                fetch(`${this.url}/config`).then(r => r.json()).then(cfg => {
+                this._fetchJson('/config').then(cfg => {
                     setTimeout(() => cb({
-                        supported_resolutions: cfg.supported_resolutions || ['1D', '1W', '1M'],
-                        supports_marks: false, supports_timescale_marks: false, supports_time: true
+                        supported_resolutions: cfg.supported_resolutions || ['1', '5', '15', '30', '60', 'D', 'W', 'M'],
+                        supports_marks: false,
+                        supports_timescale_marks: false,
+                        supports_time: true
                     }), 0);
-                }).catch(() => setTimeout(() => cb({ supported_resolutions: ['1D', '1W', '1M'] }), 0));
+                }).catch(() => setTimeout(() => cb({
+                    supported_resolutions: ['1', '5', '15', '30', '60', 'D', 'W', 'M']
+                }), 0));
             }
 
             searchSymbols(input, exchange, type, onResult) {
-                fetch(`${this.url}/search?query=${encodeURIComponent(input)}&limit=30`)
-                    .then(r => r.json()).then(onResult).catch(() => onResult([]));
+                this._fetchJson(`/search?query=${encodeURIComponent(input)}&limit=30`)
+                    .then(onResult)
+                    .catch(() => onResult([]));
             }
 
             resolveSymbol(name, onResolve, onError) {
-                fetch(`${this.url}/symbols?symbol=${encodeURIComponent(name)}`)
-                    .then(r => r.json())
+                this._fetchJson(`/symbols?symbol=${encodeURIComponent(name)}`)
                     .then(info => onResolve({
                         ...info,
                         session: info.session || '0930-1500',
                         timezone: info.timezone || 'Asia/Shanghai',
                         minmov: info.minmov || 1,
                         pricescale: info.pricescale || 100,
-                        has_intraday: false,
+                        has_intraday: true,
                         has_daily: true,
                         has_weekly_and_monthly: true,
-                        supported_resolutions: info.supported_resolutions || ['1D', '1W', '1M'],
-                        data_status: info.data_status || 'endofday'
+                        supported_resolutions: info.supported_resolutions || ['1', '5', '15', '30', '60', 'D', 'W', 'M'],
+                        data_status: info.data_status || 'streaming'
                     }))
                     .catch(e => onError(e.message));
             }
 
             getBars(symbolInfo, resolution, periodParams, onResult, onError) {
-                console.log('[DEBUG] getBars resolution:', resolution);
                 const { from, to, countBack } = periodParams;
                 const symbol = symbolInfo.ticker || symbolInfo.name;
-                let url = `${this.url}/history?symbol=${symbol}&resolution=${resolution}&from=${from}&to=${to}`;
-                if (countBack) url += `&countback=${countBack}`;
+                let path = `/history?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&from=${from}&to=${to}`;
+                if (countBack) path += `&countback=${countBack}`;
 
-                fetch(url).then(r => r.json()).then(data => {
+                this._fetchJson(path).then(data => {
                     if (data.s === 'no_data') return onResult([], { noData: true });
                     if (data.s === 'error') return onError(data.errmsg);
 
@@ -1700,59 +1778,65 @@
                     const key = `${symbol}_${resolution}`;
                     if (!window.customIndicatorData[key]) window.customIndicatorData[key] = {};
 
-                    let indicatorKey = null;
-                    if (resolution === '1D' || resolution === 'D') indicatorKey = `${symbol}_1`;
-                    else if (resolution === '1W' || resolution === 'W') indicatorKey = `${symbol}_1`;
-                    else if (resolution === '1M' || resolution === 'M') indicatorKey = `${symbol}_1`;
-                    if (indicatorKey && !window.customIndicatorData[indicatorKey]) window.customIndicatorData[indicatorKey] = {};
-
                     for (let i = 0; i < data.t.length; i++) {
                         const time = data.t[i] * 1000;
                         const bar = { time, open: data.o[i], high: data.h[i], low: data.l[i], close: data.c[i], volume: data.v[i] };
                         bars.push(bar);
                         window.customIndicatorData[key][time] = bar;
-                        if (indicatorKey) window.customIndicatorData[indicatorKey][time] = bar;
                     }
                     onResult(bars, { noData: bars.length === 0 });
                 }).catch(e => onError(e.message));
             }
 
+            _pollLatestBar(symbol, resolution, onTick) {
+                const now = Math.floor(Date.now() / 1000);
+                const lookback = ['D', '1D', 'W', '1W', 'M', '1M'].includes(resolution) ? 86400 * 30 : 86400 * 3;
+                const path = `/history?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&from=${now - lookback}&to=${now}&countback=2`;
+
+                this._fetchJson(path).then(data => {
+                    if (data.s !== 'ok' || !data.t || data.t.length === 0) return;
+                    const i = data.t.length - 1;
+                    const bar = {
+                        time: data.t[i] * 1000,
+                        open: data.o[i],
+                        high: data.h[i],
+                        low: data.l[i],
+                        close: data.c[i],
+                        volume: data.v[i]
+                    };
+                    const key = `${symbol}_${resolution}`;
+                    if (!window.customIndicatorData[key]) window.customIndicatorData[key] = {};
+                    window.customIndicatorData[key][bar.time] = bar;
+                    onTick(bar);
+                }).catch(() => {});
+            }
+
             subscribeBars(symbolInfo, resolution, onTick, listenerGuid) {
                 const symbol = symbolInfo.ticker || symbolInfo.name;
-                this.subscriptions = this.subscriptions || {};
                 this.subscriptions[listenerGuid] = { symbol, resolution, onTick };
 
-                // A 股 EOD 模式：实时推送由后端 WS 暂不可用，保留接口兼容
-                if (realtimeManager) {
-                    realtimeManager.setKlineCallback((candle) => {
-                        Object.values(this.subscriptions || {}).forEach(sub => {
-                            if (sub.symbol.toUpperCase() === candle.symbol.toUpperCase()) {
-                                const key = `${sub.symbol}_${sub.resolution}`;
-                                const bar = {
-                                    time: candle.timestamp,
-                                    open: candle.open,
-                                    high: candle.high,
-                                    low: candle.low,
-                                    close: candle.close,
-                                    volume: candle.volume
-                                };
-                                if (!window.customIndicatorData[key]) window.customIndicatorData[key] = {};
-                                window.customIndicatorData[key][candle.timestamp] = bar;
-
-                                sub.onTick(bar);
-                            }
-                        });
-                    });
-                }
+                const pollMs = ['D', '1D', 'W', '1W', 'M', '1M'].includes(resolution) ? 30000 : 10000;
+                this._pollLatestBar(symbol, resolution, onTick);
+                this._pollTimers[listenerGuid] = setInterval(
+                    () => this._pollLatestBar(symbol, resolution, onTick),
+                    pollMs
+                );
             }
 
             unsubscribeBars(listenerGuid) {
-                if (this.subscriptions) {
-                    delete this.subscriptions[listenerGuid];
+                if (this._pollTimers[listenerGuid]) {
+                    clearInterval(this._pollTimers[listenerGuid]);
+                    delete this._pollTimers[listenerGuid];
                 }
+                delete this.subscriptions[listenerGuid];
             }
 
-            getServerTime(cb) { fetch(`${this.url}/time`).then(r => r.text()).then(t => cb(parseInt(t))).catch(() => cb(Math.floor(Date.now() / 1000))); }
+            getServerTime(cb) {
+                fetch(`${this.url}/time`, getDatafeedFetchInit())
+                    .then(r => r.text())
+                    .then(t => cb(parseInt(t, 10)))
+                    .catch(() => cb(Math.floor(Date.now() / 1000)));
+            }
         }
 
         // ============ 自定义技术指标适配器骨架 ============
@@ -2369,7 +2453,7 @@
                 ],
                 disabled_features: ["study_templates"],
                 favorites: {
-                    intervals: ["1D", "1W", "1M"],
+                    intervals: ["1", "5", "15", "30", "60", "1D", "1W", "1M"],
                     drawingTools: [
                         "LineToolTrendLine",
                         "LineToolVertLine",
@@ -2386,8 +2470,10 @@
                     { text: "5y", resolution: "1W", description: "5年" },
                     { text: "1y", resolution: "1D", description: "1年" },
                     { text: "6m", resolution: "1D", description: "6个月" },
-                    { text: "3m", resolution: "1D", description: "3个月" },
-                    { text: "1m", resolution: "1D", description: "1个月" },
+                    { text: "3m", resolution: "60", description: "3个月" },
+                    { text: "1m", resolution: "15", description: "1个月" },
+                    { text: "5d", resolution: "5", description: "5日" },
+                    { text: "1d", resolution: "1", description: "1日" },
                 ],
                 overrides: {
                     "paneProperties.background": "#0F0F0F",
@@ -2582,7 +2668,7 @@
         async function waitForBackend(maxAttempts = 10, interval = 1000) {
             for (let i = 0; i < maxAttempts; i++) {
                 try {
-                    const res = await fetch(`${getApiBaseUrl()}/config`, { method: 'GET' });
+                    const res = await fetch(`${getApiBaseUrl()}/config`, { method: 'GET', ...getDatafeedFetchInit() });
                     if (res.ok) return true;
                 } catch (e) {
                     console.log(`Waiting for backend... (${i + 1}/${maxAttempts})`);
@@ -2600,18 +2686,12 @@
             initWatchlistEvents();
             initWidgetbarResizer();
 
-            // Initialize real-time WebSocket connection
+            // Initialize real-time WebSocket connection (optional fallback)
             realtimeManager = new RealtimeManager();
             realtimeManager.connect();
 
-            // Subscribe to all symbols in watchlist
-            const allSymbols = new Set();
-            Object.values(watchlistManager.lists).forEach(list => {
-                list.forEach(item => allSymbols.add(item.symbol));
-            });
-            if (allSymbols.size > 0) {
-                realtimeManager.subscribe([...allSymbols]);
-            }
+            // Poll East Money quotes for watchlist pseudo-realtime
+            startQuotePolling();
 
             // Smart chart selection: detect which iframe gets focus
             window.addEventListener('blur', () => {
@@ -2675,6 +2755,8 @@
         };
 
         async function initApp() {
+            syncSessionCookie();
+
             // DEV_MODE: skip auth for local preview
             const DEV_MODE = (location.hostname === 'localhost' || location.hostname === '127.0.0.1');
             if (!DEV_MODE) {
@@ -2682,6 +2764,10 @@
                 if (!user) {
                     window.location.href = './login.html';
                     return;
+                }
+                if (user.email) {
+                    localStorage.setItem('logged_in_email', user.email);
+                    syncSessionCookie();
                 }
                 console.log('Authenticated as:', user.email);
             } else {

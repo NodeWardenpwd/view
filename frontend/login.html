@@ -121,7 +121,7 @@
             return JSON.parse(jsonPayload);
         }
 
-        function handleCredentialResponse(response) {
+        async function handleCredentialResponse(response) {
             try {
                 const credential = response.credential;
                 const userData = parseJwt(credential);
@@ -133,9 +133,25 @@
                     sub: userData.sub
                 };
 
+                const apiOrigin = (window.API_CONFIG && window.API_CONFIG.baseUrl)
+                    ? window.API_CONFIG.baseUrl.replace(/\/$/, '')
+                    : ((location.hostname === 'localhost' || location.hostname === '127.0.0.1')
+                        ? 'http://localhost:3000'
+                        : window.location.origin);
+
+                const verifyRes = await fetch(`${apiOrigin}/auth/verify?email=${encodeURIComponent(user.email)}`);
+                const verifyData = await verifyRes.json();
+                if (!verifyData || verifyData.allowed !== true) {
+                    document.getElementById('error-msg').textContent = '您的账号不在白名单中，无权使用本系统。';
+                    document.getElementById('error-msg').style.display = 'block';
+                    return;
+                }
+
                 localStorage.setItem('auth_user', JSON.stringify(user));
                 localStorage.setItem('auth_token', credential);
                 localStorage.setItem('auth_login_time', Date.now().toString());
+                localStorage.setItem('logged_in_email', user.email);
+                document.cookie = `logged_in_email=${encodeURIComponent(user.email)}; path=/; max-age=${144 * 60 * 60}; SameSite=Lax`;
 
                 console.log('Login successful:', user.email);
                 window.location.href = REDIRECT_URL;
