@@ -584,7 +584,18 @@ async fn search_symbols(
 async fn get_history(
     State(state): State<Arc<TradingViewState>>,
     Query(query): Query<HistoryQuery>,
+	headers: axum::http::HeaderMap, // <--- 加上这一行，用来获取前端传过来的用户邮箱信息
 ) -> Json<UdfHistoryResponse> {
+    
+    // 【后端无情铁闸】：检查请求头里的邮箱（如果前端没传或者传错了，直接拒绝）
+    if let Some(user_email) = headers.get("X-User-Email").and_then(|v| v.to_str().ok()) {
+        if !check_email_allowed(user_email) {
+            return Json(UdfHistoryResponse::Error {
+                s: "error".to_string(),
+                errmsg: "未授权的非法账号，拒绝提供K线数据！".to_string(),
+            });
+        }
+    }
     let period = match resolution_to_period(&query.resolution) {
         Some(p) => p,
         None => {
@@ -842,17 +853,19 @@ pub struct VerifyResponse {
     pub allowed: bool,
 }
 
-// 注意这里去掉了 use 声明，直接使用绝对路径指定 Axum 的 Query 和 Json
+// 提取出来的公共核心拦截函数
+pub fn check_email_allowed(email: &str) -> bool {
+    let allowed_email = std::env::var("ALLOWED_EMAIL").unwrap_or_else(|_| "".to_string());
+    if allowed_email.is_empty() {
+        return false;
+    }
+    email.trim().to_lowercase() == allowed_email.trim().to_lowercase()
+}
+
+// 原有的验证接口，保持给前端调用
 pub async fn verify_email(
     axum::extract::Query(params): axum::extract::Query<VerifyParams>
 ) -> axum::response::Json<VerifyResponse> {
-    
-    // 从 Hugging Face 的 Secrets 中读取配置的环境变量
-    let allowed_email = std::env::var("ALLOWED_EMAIL").unwrap_or_else(|_| "".to_string());
-    
-    // 比较前端传过来的邮箱和环境变量是否一致
-    let is_allowed = !allowed_email.is_empty() 
-        && params.email.trim().to_lowercase() == allowed_email.trim().to_lowercase();
-    
+    let is_allowed = check_email_allowed(&params.email);
     axum::response::Json(VerifyResponse { allowed: is_allowed })
 }
