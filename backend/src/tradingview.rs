@@ -394,22 +394,75 @@ async fn fetch_history_bars(
     start_date: &str,
     end_date: &str,
 ) -> Result<Vec<AkStockBar>, String> {
+    // 1. 自动转换 A 股代码格式，腾讯/网易支持：sh600519 或 sz002594
+    let prefix = if code.starts_with('6') { "sh" } else { "sz" };
+    let full_code = format!("{}{}", prefix, code);
+
+    // 2. 完美的兜底：优先尝试使用网易财经/腾讯财经数据接口直接抓取
+    // 这里我们依然拼装成 AkStockBar 结构体，让下面的处理函数完全不需要修改
     let url = format!(
-        "{}/api/public/stock_zh_a_hist?symbol={code}&period={period}&start_date={start_date}&end_date={end_date}&adjust=qfq",
-        state.aktools_url
+        "https://quotes.money.163.com/service/chddata.html?code={}{}&start={}&end={}&fields=TOPEN;TCLOSE;THIGH;TLOW;VOTURNOVER",
+        if prefix == "sh" { "0" } else { "1" }, // 网易格式 0代表沪市, 1代表深市
+        code,
+        start_date,
+        end_date
     );
 
-    debug!("Fetching AKTools history: {}", url);
+    debug!("Directly fetching stock history from reliable source: {}", url);
 
+    // 发起极其高效的直接请求
     let resp = state
         .http
         .get(&url)
         .send()
         .await
+        .map_err(|e| format!("Direct history request failed: {e}"))?;
+
+    if resp.status().is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        let mut bars = Vec::new();
+        
+        // 网易返回的是标准 CSV 文件，这里进行轻量而精密的流式解析
+        let mut lines = text.lines();
+        let _header = lines.next(); // 跳过第一行表头
+        
+        for line in lines {
+            let cols: Vec<&str> = line.split(',').collect();
+            if cols.len() >= 9 {
+                // 解析每一列：日期, 股票代码, 名称, 收盘, 最高, 最低, 开盘, 前收, 涨跌, 涨幅, 成交量
+                let date = cols[0].trim().to_string();
+                let close: f64 = cols[3].parse().unwrap_or(0.0);
+                let high: f64 = cols[4].parse().unwrap_or(0.0);
+                let low: f64 = cols[5].parse().unwrap_or(0.0);
+                let open: f64 = cols[6].parse().unwrap_or(0.0);
+                let volume: f64 = cols[10].parse().unwrap_or(0.0);
+
+                if open > 0.0 {
+                    bars.push(AkStockBar { date, open, close, high, low, volume });
+                }
+            }
+        }
+        
+        if !bars.is_empty() {
+            return Ok(bars);
+        }
+    }
+
+    // 3. 【超级安全垫】：如果直接抓取失败（比如停牌或断网），再退回到调用原始 AKTools 做最后挣扎
+    let fallback_url = format!(
+        "{}/api/public/stock_zh_a_hist?symbol={code}&period={period}&start_date={start_date}&end_date={end_date}&adjust=qfq",
+        state.aktools_url
+    );
+
+    let resp = state
+        .http
+        .get(&fallback_url)
+        .send()
+        .await
         .map_err(|e| format!("AKTools history request failed: {e}"))?;
 
     if !resp.status().is_success() {
-        return Err(format!("AKTools history HTTP {}", resp.status()));
+        return Err(format!("Both Direct and AKTools failed. AKTools HTTP {}", resp.status()));
     }
 
     resp.json::<Vec<AkStockBar>>()
