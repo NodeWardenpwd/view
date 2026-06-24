@@ -21,8 +21,9 @@ use tokio::time::sleep;
 
 const SHANGHAI_OFFSET_SECS: i32 = 8 * 3600;
 const SUPPORTED_RESOLUTIONS: &[&str] = &["1", "5", "15", "30", "60", "D", "W", "M"];
-const TENCENT_MINS_URL: &str = "https://ifzq.gtimg.cn/appsh/tech/kline/mins";
-const TENCENT_KLINE_URL: &str = "https://proxy.finance.qq.com/ifzqgtimg/appsh/tech/kline/kline";
+const TENCENT_FQKLINE_URL: &str = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get";
+const TENCENT_MKLINE_URL: &str = "https://ifzq.gtimg.cn/appstock/app/kline/mkline";
+const TENCENT_KLINE_LIMIT: u32 = 1000;
 const TENCENT_QT_URL: &str = "https://qt.gtimg.cn/q=";
 const TENCENT_SEARCH_URL: &str = "https://proxy.finance.qq.com/ifzqgtimg/appstock/code/search";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -167,6 +168,7 @@ enum UdfHistoryResponse {
 #[derive(Serialize)]
 struct QuoteItem {
     symbol: String,
+    name: String,
     last: f64,
     change: f64,
     change_percent: f64,
@@ -465,6 +467,12 @@ fn parse_bar_timestamp(date_str: &str) -> Option<i64> {
         }
     }
 
+    if value.len() == 12 && value.chars().all(|c| c.is_ascii_digit()) {
+        if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y%m%d%H%M") {
+            return shanghai.from_local_datetime(&dt).single().map(|dt| dt.timestamp());
+        }
+    }
+
     None
 }
 
@@ -495,19 +503,20 @@ fn tencent_symbol(market: &str, clean_code: &str) -> String {
 }
 
 fn tencent_kline_url(market: &str, clean_code: &str, period: &str) -> Option<String> {
+    let symbol = tencent_symbol(market, clean_code);
     if matches!(period, "1" | "5" | "15" | "30" | "60") {
         Some(format!(
-            "{TENCENT_MINS_URL}?symbol={market}{clean_code}&type=m{period}"
+            "{TENCENT_MKLINE_URL}?param={symbol},m{period},,{TENCENT_KLINE_LIMIT}"
         ))
     } else {
-        let tencent_type = match period {
-            "D" | "d" => "qfqday",
-            "W" | "w" => "qfqweek",
-            "M" | "m" => "qfqmonth",
+        let unit = match period {
+            "D" | "d" => "day",
+            "W" | "w" => "week",
+            "M" | "m" => "month",
             _ => return None,
         };
         Some(format!(
-            "{TENCENT_KLINE_URL}?symbol={market}{clean_code}&type={tencent_type}"
+            "{TENCENT_FQKLINE_URL}?param={symbol},{unit},,,{TENCENT_KLINE_LIMIT},qfq"
         ))
     }
 }
@@ -912,6 +921,7 @@ async fn fetch_quotes(
                 symbol.clone(),
                 QuoteItem {
                     symbol,
+                    name: q.name,
                     last: q.last,
                     change: q.change,
                     change_percent: q.change_percent,
@@ -1066,6 +1076,14 @@ async fn get_history(
                 .collect();
 
             parsed.sort_by_key(|(ts, _)| *ts);
+
+            if parsed.is_empty() {
+                parsed = bars
+                    .iter()
+                    .filter_map(|bar| parse_bar_timestamp(&bar.date).map(|ts| (ts, bar)))
+                    .collect();
+                parsed.sort_by_key(|(ts, _)| *ts);
+            }
 
             if let Some(countback) = query.countback {
                 if parsed.len() > countback as usize {

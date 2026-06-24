@@ -920,7 +920,7 @@
                                 <line x1="5" y1="12" x2="19" y2="12"></line>
                             </svg>
                         </button>
-                        <button class="header-btn" title="设置">
+                        <button class="header-btn" id="btnWatchlistSettings" title="设置">
                             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor"
                                 stroke-width="2">
                                 <circle cx="12" cy="12" r="1"></circle>
@@ -974,7 +974,7 @@
 
                 <!-- List Header -->
                 <div class="list-header">
-                    <span class="list-header-symbol">代码</span>
+                    <span class="list-header-symbol">名称</span>
                     <div class="list-header-values">
                         <span>最新价</span>
                         <span>涨跌幅</span>
@@ -1312,11 +1312,12 @@
         // ============ Fetch Supported Symbols from Backend ============
         async function fetchSupportedSymbols() {
             try {
-                const res = await fetch(`${getApiBaseUrl()}/tracked-symbols`, getDatafeedFetchInit());
+                const res = await fetch(`${getApiBaseUrl()}/search?query=&limit=50`, getDatafeedFetchInit());
                 if (res.ok) {
-                    const symbols = await res.json();
-                    return symbols.map(symbol => ({
-                        symbol: symbol,
+                    const results = await res.json();
+                    return results.map(entry => ({
+                        symbol: entry.symbol,
+                        name: (entry.description || entry.symbol).replace(/\s+\d{6}$/, '').trim(),
                         last: 0,
                         change: 0,
                         changePercent: 0,
@@ -1365,6 +1366,7 @@
                         item.last = quote.last;
                         item.change = quote.change;
                         item.changePercent = quote.change_percent;
+                        if (quote.name) item.name = quote.name;
                     });
                 });
                 watchlistManager.render();
@@ -1569,7 +1571,7 @@
                                     <circle cx="16" cy="4" r="2"/><circle cx="16" cy="12" r="2"/><circle cx="16" cy="20" r="2"/>
                                 </svg>
                             </div>
-                            <div class="item-symbol">${item.symbol}</div>
+                            <div class="item-symbol">${item.name || item.symbol}</div>
                             <div class="item-values">
                                 <div class="item-last ${colorClass}">${this.formatNumber(item.last, 2)}</div>
                                 <div class="item-change ${colorClass}">${sign}${this.formatNumber(item.changePercent)}%</div>
@@ -1749,24 +1751,35 @@
 
             resolveSymbol(name, onResolve, onError) {
                 this._fetchJson(`/symbols?symbol=${encodeURIComponent(name)}`)
-                    .then(info => onResolve({
-                        ...info,
-                        session: info.session || '0930-1500',
-                        timezone: info.timezone || 'Asia/Shanghai',
-                        minmov: info.minmov || 1,
-                        pricescale: info.pricescale || 100,
-                        has_intraday: true,
-                        has_daily: true,
-                        has_weekly_and_monthly: true,
-                        supported_resolutions: info.supported_resolutions || ['1', '5', '15', '30', '60', 'D', 'W', 'M'],
-                        data_status: info.data_status || 'streaming'
-                    }))
+                    .then(info => {
+                        const displayName = (info.description || info.name || name).trim();
+                        const ticker = info.ticker || info.symbol || name;
+                        onResolve({
+                            ...info,
+                            ticker,
+                            name: displayName,
+                            description: displayName,
+                            session: info.session || '0930-1500',
+                            timezone: info.timezone || 'Asia/Shanghai',
+                            minmov: info.minmov || 1,
+                            pricescale: info.pricescale || 100,
+                            has_intraday: true,
+                            has_daily: true,
+                            has_weekly_and_monthly: true,
+                            supported_resolutions: info.supported_resolutions || ['1', '5', '15', '30', '60', 'D', 'W', 'M'],
+                            data_status: info.data_status || 'streaming'
+                        });
+                    })
                     .catch(e => onError(e.message));
+            }
+
+            _resolveTicker(symbolInfo) {
+                return symbolInfo.ticker || symbolInfo.symbol;
             }
 
             getBars(symbolInfo, resolution, periodParams, onResult, onError) {
                 const { from, to, countBack } = periodParams;
-                const symbol = symbolInfo.ticker || symbolInfo.name;
+                const symbol = this._resolveTicker(symbolInfo);
                 let path = `/history?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&from=${from}&to=${to}`;
                 if (countBack) path += `&countback=${countBack}`;
 
@@ -1812,7 +1825,7 @@
             }
 
             subscribeBars(symbolInfo, resolution, onTick, listenerGuid) {
-                const symbol = symbolInfo.ticker || symbolInfo.name;
+                const symbol = this._resolveTicker(symbolInfo);
                 this.subscriptions[listenerGuid] = { symbol, resolution, onTick };
 
                 const pollMs = ['D', '1D', 'W', '1W', 'M', '1M'].includes(resolution) ? 30000 : 10000;
@@ -2437,6 +2450,8 @@
                 datafeed: new CustomDatafeed(getApiBaseUrl()),
                 library_path: "charting_library/",
                 locale: "zh",
+                timezone: "Asia/Shanghai",
+                symbol_search_request_delay: 300,
                 fullscreen: false,
                 autosize: true,
                 theme: isDarkTheme ? "Dark" : "Light",
@@ -2450,8 +2465,12 @@
                     "create_volume_indicator_by_default",
                     "items_favoriting",
                     "save_chart_properties_to_local_storage",
+                    "use_localstorage_for_settings",
+                    "header_settings",
+                    "chart_property_page",
+                    "show_chart_property_page",
                 ],
-                disabled_features: ["study_templates"],
+                disabled_features: [],
                 favorites: {
                     intervals: ["1", "5", "15", "30", "60", "1D", "1W", "1M"],
                     drawingTools: [
@@ -2571,6 +2590,12 @@
             // Add symbol button
             document.getElementById('btnAddSymbol').addEventListener('click', toggleAddPanel);
 
+            // Watchlist settings button opens list management menu
+            document.getElementById('btnWatchlistSettings').addEventListener('click', (e) => {
+                e.stopPropagation();
+                watchlistManager.toggleDropdown();
+            });
+
             // Add symbol confirm
             document.getElementById('btnAddSymbolConfirm').addEventListener('click', () => {
                 const input = document.getElementById('newSymbolInput');
@@ -2685,6 +2710,11 @@
             // Initialize watchlist
             initWatchlistEvents();
             initWidgetbarResizer();
+
+            // Ensure chart iframes remain clickable (clear stale drag locks)
+            document.querySelectorAll('.chart-cell.no-pointer-events').forEach(cell => {
+                cell.classList.remove('no-pointer-events');
+            });
 
             // Initialize real-time WebSocket connection (optional fallback)
             realtimeManager = new RealtimeManager();
