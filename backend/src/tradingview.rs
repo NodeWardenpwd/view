@@ -1040,6 +1040,52 @@ async fn search_symbols(
     Ok(Json(results))
 }
 
+fn select_bars_for_history(
+    bars: &[StockBar],
+    from: i64,
+    to: i64,
+    countback: Option<i64>,
+) -> Vec<(i64, &StockBar)> {
+    let mut parsed: Vec<(i64, &StockBar)> = bars
+        .iter()
+        .filter_map(|bar| parse_bar_timestamp(&bar.date).map(|ts| (ts, bar)))
+        .collect();
+
+    parsed.sort_by_key(|(ts, _)| *ts);
+
+    if parsed.is_empty() {
+        return parsed;
+    }
+
+    // TradingView may send invalid negative timestamps on first load (e.g. year 1941).
+    // Only apply from/to filtering when the range looks sane.
+    let range_valid = from >= 0 && to >= from;
+
+    if range_valid {
+        let filtered: Vec<(i64, &StockBar)> = parsed
+            .iter()
+            .copied()
+            .filter(|(ts, _)| *ts >= from && *ts <= to)
+            .collect();
+        if !filtered.is_empty() {
+            parsed = filtered;
+        }
+    } else {
+        warn!(
+            "Ignoring invalid history range from={from} to={to}, returning latest bars"
+        );
+    }
+
+    if let Some(countback) = countback {
+        let cb = countback.max(1) as usize;
+        if parsed.len() > cb {
+            parsed = parsed.split_off(parsed.len() - cb);
+        }
+    }
+
+    parsed
+}
+
 async fn get_history(
     headers: HeaderMap,
     State(state): State<Arc<TradingViewState>>,
@@ -1069,27 +1115,7 @@ async fn get_history(
 
     match fetch_history_bars(&state, &code, period).await {
         Ok(bars) => {
-            let mut parsed: Vec<(i64, &StockBar)> = bars
-                .iter()
-                .filter_map(|bar| parse_bar_timestamp(&bar.date).map(|ts| (ts, bar)))
-                .filter(|(ts, _)| *ts >= query.from && *ts <= query.to)
-                .collect();
-
-            parsed.sort_by_key(|(ts, _)| *ts);
-
-            if parsed.is_empty() {
-                parsed = bars
-                    .iter()
-                    .filter_map(|bar| parse_bar_timestamp(&bar.date).map(|ts| (ts, bar)))
-                    .collect();
-                parsed.sort_by_key(|(ts, _)| *ts);
-            }
-
-            if let Some(countback) = query.countback {
-                if parsed.len() > countback as usize {
-                    parsed = parsed.split_off(parsed.len() - countback as usize);
-                }
-            }
+            let parsed = select_bars_for_history(&bars, query.from, query.to, query.countback);
 
             if parsed.is_empty() {
                 return Ok(Json(UdfHistoryResponse::NoData {
