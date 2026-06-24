@@ -211,6 +211,7 @@ struct HistoryQuery {
     from: i64,
     to: i64,
     countback: Option<i64>,
+	user_email: Option<String>,
 }
 
 // ============ Symbol Helpers ============

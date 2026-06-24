@@ -1,10 +1,10 @@
 window.API_CONFIG = { baseUrl: '/' };
 
-// 全局存储当前登录成功且通过验证的邮箱
+// 仅仅用来记录状态，不污染全局 fetch
 window.CURRENT_USER_EMAIL = localStorage.getItem('logged_in_email') || '';
 
 const AUTH_CONFIG = {
-    clientId: '135530387130-1v6j13pgrl79r0t1fg9mrsu6kd20rine.apps.googleusercontent.com', // 填你自己的
+    clientId: '135530387130-1v6j13pgrl79r0t1fg9mrsu6kd20rine.apps.googleusercontent.com', // 记得填你自己的
     
     onSuccess: async (user) => {
         try {
@@ -26,7 +26,7 @@ const AUTH_CONFIG = {
                 return;
             }
             
-            // 验证通过，记录邮箱
+            // 真正通过后才记录
             localStorage.setItem('logged_in_email', user.email);
             window.CURRENT_USER_EMAIL = user.email;
             
@@ -46,13 +46,3 @@ const AUTH_CONFIG = {
 };
 
 window.AUTH_CONFIG = AUTH_CONFIG;
-
-// 【核心补丁】：拦截所有前端 fetch 请求，自动给后端送上 X-User-Email 供后端验身
-const originalFetch = window.fetch;
-window.fetch = function (url, options = {}) {
-    options.headers = options.headers || {};
-    if (window.CURRENT_USER_EMAIL) {
-        options.headers['X-User-Email'] = window.CURRENT_USER_EMAIL;
-    }
-    return originalFetch(url, options);
-};
