@@ -2706,24 +2706,38 @@
         window.addEventListener('DOMContentLoaded', initApp);
 		
 		// ==========================================
-        // 🔒 【前后端双重铁闸】无痕模式及恶意换号拦截补丁
+        // 🔒 【前后端双重铁闸】UDF 路径修复与安全追踪补丁
         // ==========================================
         (function() {
             // 1. 动态获取当前本地成功通过验证的邮箱
             const userEmail = localStorage.getItem('logged_in_email') || '';
 
-            // 2. 强力拦截浏览器的网络请求，只要发现是向后端要 K 线数据的，硬核挂上当前邮箱
+            // 2. 强力拦截并纠正浏览器的 fetch 请求，确保绝对路径和邮箱同时生效
             const originalFetch = window.fetch;
             window.fetch = function(url, options = {}) {
-                // 如果是正常的 API 请求
-                if (typeof url === 'string' && (url.includes('/config') || url.includes('/symbols') || url.includes('/history') || url.includes('/search'))) {
-                    // 动态转换路径，顺带把 user_email 拼接到 URL 后面送给 Rust 后端
-                    const separator = url.includes('?') ? '&' : '?';
-                    url = url + separator + 'user_email=' + encodeURIComponent(userEmail);
+                if (typeof url === 'string') {
+                    // 检查是否是图表库发出的核心 UDF 接口
+                    if (url.includes('/config') || url.includes('/symbols') || url.includes('/history') || url.includes('/search')) {
+                        
+                        let targetUrl = url;
+                        // 【路径防走偏核心修复】：如果发现被 TradingView 组件拼成了相对盲区，强制给它掰回正确的本站 API 路径
+                        if (targetUrl.startsWith('config') || targetUrl.startsWith('/config')) {
+                            targetUrl = '/api/config';
+                        } else if (!targetUrl.startsWith('/api') && !targetUrl.startsWith('http')) {
+                            targetUrl = '/api/' + targetUrl.replace(/^\//, '');
+                        }
+
+                        // 动态拼装 user_email 参数
+                        const separator = targetUrl.includes('?') ? '&' : '?';
+                        targetUrl = targetUrl + separator + 'user_email=' + encodeURIComponent(userEmail);
+                        
+                        // 让浏览器请求真正正确的地址
+                        return originalFetch(targetUrl, options);
+                    }
                 }
                 return originalFetch(url, options);
             };
-            console.log("【安全卫士】UDF 邮箱动态追踪补丁已成功注入！");
+            console.log("【安全卫士】路径修复与邮箱追踪铁闸已完美就位！");
         })();
     </script>
 </body>
