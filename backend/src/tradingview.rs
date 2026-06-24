@@ -399,7 +399,7 @@ async fn fetch_history_bars(
         format!("1.{}", code) // 沪市
     } else {
         format!("0.{}", code) // 深市
-    }
+    };
 
     // 将 20260624 格式转换为 2026-06-24 格式供东财识别
     let formatted_start = if start_date.len() == 8 {
