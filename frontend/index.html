@@ -2476,7 +2476,20 @@ return {
     },
 };`;
 
-        const DEFAULT_MACD_SCRIPT = `// MACD 副图指标 — isPriceStudy: false → K 线下方独立副图区域
+        const DEFAULT_MACD_SCRIPT = `// ========== 副图指标示例（MACD）==========
+// 只需编写 return { ... } 脚本，保存后点【应用到图表】，无需修改程序代码。
+// isPriceStudy: false → 独立副图；true → 叠加主图 K 线
+//
+// context 可用字段：
+//   close/open/high/low/volume  当前 bar 数值
+//   closes()/opens()/highs()/lows()/volumes()  历史数组
+//   barIndex / currentIndex / is_first_bar / isLastBar
+//   getCache()  指标私有增量缓存（按脚本 id 隔离，首 bar 自动可用）
+//   resetCache()  清空本指标缓存
+//
+// plots 类型：line | histogram | shapes | colorer（配合 palettes）
+// shapes 无信号时返回 NaN，有信号返回副图 Y 值；hist 零轴上正、下负，禁止 Math.abs()
+
 function ema(values, length) {
     if (!values || values.length < length) return NaN;
     const k = 2 / (length + 1);
@@ -2489,19 +2502,19 @@ function ema(values, length) {
 
 return {
     id: 'UserMACD@tv-basicstudies-1',
-    name: '自定义 MACD',
-    description: '自定义 MACD',
-    shortDescription: 'MACD',
+    name: '示例 MACD',
+    description: '示例 MACD',
     isPriceStudy: false,
+    minDepth: 40,
     inputs: [
         { id: 'fast', name: '快线', type: 'integer', defval: 12, min: 1, max: 200 },
         { id: 'slow', name: '慢线', type: 'integer', defval: 26, min: 1, max: 500 },
         { id: 'signal', name: '信号线', type: 'integer', defval: 9, min: 1, max: 200 },
     ],
     plots: [
-        { id: 'macd', title: 'MACD', type: 'line', color: '#2196F3' },
-        { id: 'signal', title: 'Signal', type: 'line', color: '#FF9800' },
-        { id: 'hist', title: 'Histogram', type: 'histogram', color: '#26a69a' },
+        { id: 'macd', type: 'line', color: '#26A69A' },
+        { id: 'signal', type: 'line', color: '#FFD600' },
+        { id: 'hist', type: 'histogram', color: '#26A69A', linewidth: 5 },
     ],
     main(context, inputs) {
         const fast = Number(inputs.fast) || 12;
@@ -2513,18 +2526,14 @@ return {
         const macdSeries = [];
         for (let i = slow; i <= closes.length; i++) {
             const slice = closes.slice(0, i);
-            const fastEma = ema(slice, fast);
-            const slowEma = ema(slice, slow);
-            if (Number.isNaN(fastEma) || Number.isNaN(slowEma)) {
-                macdSeries.push(NaN);
-            } else {
-                macdSeries.push(fastEma - slowEma);
-            }
+            const f = ema(slice, fast);
+            const s = ema(slice, slow);
+            macdSeries.push(Number.isNaN(f) || Number.isNaN(s) ? NaN : f - s);
         }
         const macdVal = macdSeries[macdSeries.length - 1];
         const signalVal = ema(macdSeries.filter(v => !Number.isNaN(v)), sigLen);
-        const hist = Number.isNaN(macdVal) || Number.isNaN(signalVal) ? NaN : macdVal - signalVal;
-        return [macdVal, signalVal, hist];
+        const histVal = Number.isNaN(macdVal) || Number.isNaN(signalVal) ? NaN : macdVal - signalVal;
+        return [macdVal, signalVal, histVal];
     },
 };`;
 
@@ -2566,7 +2575,7 @@ return {
             };
             store.scripts[macdId] = {
                 id: macdId,
-                name: '自定义 MACD',
+                name: '示例 MACD',
                 code: DEFAULT_MACD_SCRIPT,
                 updatedAt: Date.now() - 1,
             };
@@ -3036,6 +3045,54 @@ return {
             console.log(`[策略回测] ${definition.name} | 屏幕 K 线 ${bars.length} 根 | 模拟累计收益率 ${pnl?.toFixed(2)}%`);
         }
 
+        function buildInputsObject(inp, inputDefs) {
+            if (inp && typeof inp === 'object' && typeof inp !== 'function') return inp;
+            const obj = {};
+            (inputDefs || []).forEach((def, i) => {
+                let val;
+                try {
+                    val = typeof inp === 'function' ? inp(i) : inp?.[def.id];
+                } catch (e) {
+                    val = undefined;
+                }
+                obj[def.id] = val !== undefined && val !== null ? val : def.defval;
+            });
+            return obj;
+        }
+
+        function computeStudyMinDepth(def, inputsObj) {
+            let depth = Number(def.minDepth) || 50;
+            for (const input of (def.inputs || [])) {
+                if (input.type === 'integer' || input.type === 'float' || !input.type) {
+                    depth = Math.max(depth, Number(inputsObj?.[input.id] ?? input.defval) || 0);
+                }
+            }
+            return depth + 50;
+        }
+
+        function makeStudyCacheKey(studyId) {
+            return `_study_cache_${String(studyId || 'unknown').replace(/[^a-zA-Z0-9_]/g, '_')}`;
+        }
+
+        function mapPlotToMetainfo(plot, userStyles) {
+            if (plot.type === 'colorer') {
+                return {
+                    id: plot.id,
+                    type: 'colorer',
+                    target: plot.target,
+                    palette: plot.palette,
+                };
+            }
+            if (plot.type === 'shapes') {
+                return { id: plot.id, type: 'shapes' };
+            }
+            const styleType = userStyles[plot.id]?.type;
+            return {
+                id: plot.id,
+                type: plot.type === 'histogram' || styleType === 'histogram' ? 'histogram' : (plot.type || 'line'),
+            };
+        }
+
         function normalizeStudyPlotOutput(result, plotDefs) {
             const plotIds = (plotDefs || []).map(p => p.id);
             const items = Array.isArray(result) ? result : [result];
@@ -3072,7 +3129,7 @@ return {
             if (plot.type === 'histogram') {
                 return {
                     linestyle: 0,
-                    linewidth: 1,
+                    linewidth: plot.linewidth || 5,
                     plottype: 5,
                     transparency: 0,
                     color: plot.color || '#2196F3',
@@ -3093,8 +3150,13 @@ return {
             const onMainChart = resolvePriceStudyFlags(def);
             const displayName = def.description || def.name;
             const studyId = def.id || `${String(def.name).replace(/\s+/g, '')}@tv-basicstudies-1`;
+            const studyCacheKey = makeStudyCacheKey(studyId);
             const userDefaults = def.defaults || {};
             const userStyles = def.styles || {};
+            const metainfoPlots = def.plots.map(plot => mapPlotToMetainfo(plot, userStyles));
+            const defaultPalettes = userDefaults.palettes || (def.palettes ? Object.fromEntries(
+                Object.entries(def.palettes).map(([key, pal]) => [key, { colors: pal.colors }])
+            ) : undefined);
 
             return {
                 name: def.name,
@@ -3112,21 +3174,19 @@ return {
                     inputs: (def.inputs || []).map(input => ({
                         id: input.id,
                         name: input.name,
-                        type: input.type || 'integer',
+                        type: input.type === 'bool' ? 'bool' : (input.type || 'integer'),
                         defval: input.defval,
                         min: input.min,
                         max: input.max,
                     })),
-                    plots: def.plots.map(plot => ({
-                        id: plot.id,
-                        type: plot.type === 'shapes' ? 'shapes'
-                            : (userStyles[plot.id]?.type === 'histogram' ? 'histogram' : (plot.type || 'line')),
-                    })),
+                    plots: metainfoPlots,
+                    ...(def.palettes ? { palettes: def.palettes } : {}),
                     defaults: {
-                        styles: userDefaults.styles || Object.fromEntries(def.plots.map(plot => [plot.id, buildPlotStyleDefaults(plot)])),
+                        styles: userDefaults.styles || Object.fromEntries(def.plots.filter(p => p.type !== 'colorer').map(plot => [plot.id, buildPlotStyleDefaults(plot)])),
                         inputs: userDefaults.inputs || Object.fromEntries((def.inputs || []).map(input => [input.id, input.defval])),
+                        ...(defaultPalettes ? { palettes: defaultPalettes } : {}),
                     },
-                    styles: Object.fromEntries(def.plots.map(plot => [
+                    styles: Object.fromEntries(def.plots.filter(p => p.type !== 'colorer').map(plot => [
                         plot.id,
                         userStyles[plot.id] || { title: plot.title || plot.id },
                     ])),
@@ -3141,12 +3201,10 @@ return {
                             || (window.parent && window.parent.PineJS)
                             || null;
                         const root = getIndicatorDataRoot();
-                        delete root._macd_final_cache;
-                        if (typeof window !== 'undefined') delete window._macd_final_cache;
-                        const depth = Math.max(
-                            Number(inp.slow) || Number(inp.slowLen) || 26,
-                            Number(inp.fast) || Number(inp.fastLen) || 12,
-                        ) + (Number(inp.signal) || 9) + 50;
+                        delete root[studyCacheKey];
+                        if (typeof window !== 'undefined') delete window[studyCacheKey];
+                        const inputsObj = buildInputsObject(inp, def.inputs);
+                        const depth = computeStudyMinDepth(def, inputsObj);
                         if (ctx && typeof ctx.setMinimumAdditionalDepth === 'function') {
                             ctx.setMinimumAdditionalDepth(depth);
                         }
@@ -3218,7 +3276,19 @@ return {
                             lows: () => history.map(b => b.low),
                             closes: () => history.map(b => b.close),
                             volumes: () => history.map(b => b.volume),
-                            input: (name) => inp[name],
+                            getCache: () => {
+                                const root = getIndicatorDataRoot();
+                                if (!root[studyCacheKey]) root[studyCacheKey] = {};
+                                return root[studyCacheKey];
+                            },
+                            resetCache: () => {
+                                const root = getIndicatorDataRoot();
+                                delete root[studyCacheKey];
+                            },
+                            input: (name) => {
+                                const inputsObj = buildInputsObject(inp, def.inputs);
+                                return inputsObj[name];
+                            },
                             reportStrategyPnl: () => {
                                 if (sym?.isLastBar || idx === bars.length - 1) {
                                     setTimeout(() => runStrategyBacktestForDefinition(def), 0);
@@ -3226,7 +3296,8 @@ return {
                             },
                         };
 
-                        const result = def.main(context, inp);
+                        const inputsObj = buildInputsObject(inp, def.inputs);
+                        const result = def.main(context, inputsObj);
                         return normalizeStudyPlotOutput(result, def.plots);
                     };
                 },
