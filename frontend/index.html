@@ -43,6 +43,140 @@
             user-select: none;
         }
 
+        .main-column {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+            height: 100%;
+        }
+
+        #tv_chart_container {
+            flex: 1;
+            height: auto;
+            min-height: 180px;
+            min-width: 0;
+            background: #0F0F0F;
+        }
+
+        .script-editor-resizer {
+            height: 5px;
+            cursor: row-resize;
+            background: #3D3D3D;
+            flex-shrink: 0;
+            touch-action: none;
+        }
+
+        .script-editor-resizer:hover,
+        body.script-resizing .script-editor-resizer {
+            background: #2962ff;
+        }
+
+        .script-editor-panel {
+            height: 280px;
+            min-height: 120px;
+            max-height: 55vh;
+            display: flex;
+            flex-direction: column;
+            background: #1e1e1e;
+            border-top: 1px solid #2a2e39;
+            flex-shrink: 0;
+        }
+
+        .script-editor-toolbar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            background: #131722;
+            border-bottom: 1px solid #2a2e39;
+            flex-shrink: 0;
+            flex-wrap: wrap;
+        }
+
+        .script-editor-toolbar .toolbar-group {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .script-editor-toolbar .toolbar-spacer {
+            flex: 1;
+        }
+
+        .script-btn {
+            padding: 5px 12px;
+            border-radius: 4px;
+            border: 1px solid #363a45;
+            background: #2a2e39;
+            color: #d1d4dc;
+            font-size: 12px;
+            cursor: pointer;
+            transition: background 0.15s, border-color 0.15s;
+        }
+
+        .script-btn:hover {
+            background: #363a45;
+            border-color: #434651;
+        }
+
+        .script-btn-primary {
+            background: #2962ff;
+            border-color: #2962ff;
+            color: #fff;
+        }
+
+        .script-btn-primary:hover {
+            background: #1e53e5;
+            border-color: #1e53e5;
+        }
+
+        .script-select {
+            min-width: 160px;
+            max-width: 220px;
+            padding: 5px 8px;
+            border-radius: 4px;
+            border: 1px solid #363a45;
+            background: #1e222d;
+            color: #d1d4dc;
+            font-size: 12px;
+        }
+
+        .script-strategy-pnl {
+            font-size: 12px;
+            color: #787b86;
+            white-space: nowrap;
+            padding: 0 4px;
+        }
+
+        .script-strategy-pnl.is-positive {
+            color: #26a69a;
+        }
+
+        .script-strategy-pnl.is-negative {
+            color: #ef5350;
+        }
+
+        .script-editor-body {
+            flex: 1;
+            min-height: 0;
+            position: relative;
+        }
+
+        #monacoEditorContainer {
+            position: absolute;
+            inset: 0;
+        }
+
+        body.script-resizing {
+            cursor: row-resize !important;
+            user-select: none;
+        }
+
+        body.script-resizing .chart-cell {
+            pointer-events: none;
+        }
+
         /* Scrollbar */
         ::-webkit-scrollbar {
             width: 4px;
@@ -66,13 +200,6 @@
             display: flex;
             height: 100vh;
             width: 100vw;
-        }
-
-        #tv_chart_container {
-            flex: 1;
-            height: 100%;
-            min-width: 0;
-            background: #0F0F0F;
         }
 
         /* Right widgets area */
@@ -889,12 +1016,31 @@
     </style>
     <script src="charting_library/charting_library.standalone.js"></script>
     <script src="datafeeds/udf/dist/bundle.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs/loader.js"></script>
 </head>
 
 <body onclick="handleBodyClick(event)">
     <div class="layout-container">
-        <div id="tv_chart_container" class="charts-layout layout-single">
-            <div class="chart-cell" id="chart_0"></div>
+        <div class="main-column">
+            <div id="tv_chart_container" class="charts-layout layout-single">
+                <div class="chart-cell" id="chart_0"></div>
+            </div>
+            <div class="script-editor-resizer" id="scriptEditorResizer"></div>
+            <div class="script-editor-panel" id="scriptEditorPanel">
+                <div class="script-editor-toolbar">
+                    <div class="toolbar-group">
+                        <select class="script-select" id="scriptSelector" title="已保存脚本"></select>
+                        <button type="button" class="script-btn" id="btnNewScript">新建脚本</button>
+                        <button type="button" class="script-btn" id="btnSaveScript">保存脚本</button>
+                        <button type="button" class="script-btn script-btn-primary" id="btnApplyScript">应用到图表</button>
+                    </div>
+                    <div class="toolbar-spacer"></div>
+                    <div class="script-strategy-pnl" id="scriptStrategyPnl">模拟累计收益率: --</div>
+                </div>
+                <div class="script-editor-body">
+                    <div id="monacoEditorContainer"></div>
+                </div>
+            </div>
         </div>
 
         <div class="right-widgets">
@@ -2083,28 +2229,342 @@
             }
         }
 
-        // ============ 自定义技术指标适配器骨架 ============
-        // 以后新增 Pine Script 指标时，只需在 CUSTOM_INDICATOR_REGISTRY 中追加一项即可。
+        // ============ 用户脚本 / 指标策略编辑器 ============
 
-        const CUSTOM_INDICATOR_REGISTRY = [
-            {
-                id: 'CustomSMA@tv-basicstudies-1',
-                name: '示例均线 (SMA)',
-                description: '基于 K 线收盘价计算的简单移动平均线（适配器模板）',
-                shortDescription: 'SMA示例',
-                isPriceStudy: true,
-                inputs: [{ id: 'length', name: '周期', type: 'integer', defval: 20, min: 1, max: 500 }],
-                plots: [{ id: 'sma', title: 'SMA', type: 'line' }],
-                calculate(context, inputs) {
-                    const length = inputs.length || 20;
-                    const closes = context.closes();
-                    if (closes.length < length) return [NaN];
-                    const slice = closes.slice(-length);
-                    const sum = slice.reduce((acc, v) => acc + v, 0);
-                    return [sum / length];
-                }
+        const USER_SCRIPTS_STORAGE_KEY = 'tv_user_scripts_v1';
+        const USER_SCRIPT_REGISTRY = [];
+        let monacoEditor = null;
+        let activeScriptId = null;
+        let pendingApplyStudyName = null;
+
+        const DEFAULT_DUAL_MA_STRATEGY_SCRIPT = `// ========== 双均线交易策略模板（指标 + 策略信号）==========
+// 修改 main 逻辑后点击【应用到图表】，指标线与买卖箭头将实时渲染到 K 线图
+
+function sma(values, length) {
+    if (!values || values.length < length) return NaN;
+    const slice = values.slice(-length);
+    return slice.reduce((sum, v) => sum + v, 0) / length;
+}
+
+return {
+    id: 'UserDualMAStrategy@tv-basicstudies-1',
+    name: '双均线交易策略',
+    description: '快线/慢线金叉死叉策略，含 MA 均线与买卖箭头',
+    shortDescription: '双均线策略',
+    isPriceStudy: true,
+    inputs: [
+        { id: 'fastLen', name: '快线周期', type: 'integer', defval: 5, min: 1, max: 500 },
+        { id: 'slowLen', name: '慢线周期', type: 'integer', defval: 20, min: 2, max: 500 },
+    ],
+    plots: [
+        { id: 'fast_ma', title: '快线 MA', type: 'line', color: '#FF9800' },
+        { id: 'slow_ma', title: '慢线 MA', type: 'line', color: '#2196F3' },
+        {
+            id: 'buy_signal',
+            title: '买入',
+            type: 'shapes',
+            shape: 'shape_arrow_up',
+            location: 'BelowBar',
+            color: '#26a69a',
+        },
+        {
+            id: 'sell_signal',
+            title: '卖出',
+            type: 'shapes',
+            shape: 'shape_arrow_down',
+            location: 'AboveBar',
+            color: '#ef5350',
+        },
+    ],
+    main(context, inputs) {
+        const fastLen = Number(inputs.fastLen) || 5;
+        const slowLen = Number(inputs.slowLen) || 20;
+        const closes = context.closes();
+        const bar = context.bar;
+
+        const fastMa = sma(closes, fastLen);
+        const slowMa = sma(closes, slowLen);
+
+        let signal = 0;
+        if (closes.length > slowLen) {
+            const prevCloses = closes.slice(0, -1);
+            const prevFast = sma(prevCloses, fastLen);
+            const prevSlow = sma(prevCloses, slowLen);
+            if (!Number.isNaN(prevFast) && !Number.isNaN(prevSlow)
+                && !Number.isNaN(fastMa) && !Number.isNaN(slowMa)) {
+                if (prevFast <= prevSlow && fastMa > slowMa) signal = 1;
+                if (prevFast >= prevSlow && fastMa < slowMa) signal = -1;
             }
-        ];
+        }
+
+        const buyY = signal === 1 && bar ? bar.low : NaN;
+        const sellY = signal === -1 && bar ? bar.high : NaN;
+
+        if (context.isLastBar && typeof context.reportStrategyPnl === 'function') {
+            context.reportStrategyPnl({ fastLen, slowLen, signal });
+        }
+
+        return [fastMa, slowMa, buyY, sellY];
+    },
+};`;
+
+        function escapeHtml(text) {
+            return String(text)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/"/g, '&quot;');
+        }
+
+        function loadUserScriptsStore() {
+            try {
+                const raw = localStorage.getItem(USER_SCRIPTS_STORAGE_KEY);
+                if (!raw) return { activeId: null, scripts: {} };
+                const parsed = JSON.parse(raw);
+                return {
+                    activeId: parsed.activeId || null,
+                    scripts: parsed.scripts && typeof parsed.scripts === 'object' ? parsed.scripts : {},
+                };
+            } catch (e) {
+                console.warn('Failed to load user scripts:', e);
+                return { activeId: null, scripts: {} };
+            }
+        }
+
+        function saveUserScriptsStore(store) {
+            localStorage.setItem(USER_SCRIPTS_STORAGE_KEY, JSON.stringify(store));
+        }
+
+        function seedDefaultUserScriptIfEmpty(store) {
+            if (Object.keys(store.scripts).length > 0) return store;
+            const id = 'UserDualMAStrategy@tv-basicstudies-1';
+            store.scripts[id] = {
+                id,
+                name: '双均线交易策略',
+                code: DEFAULT_DUAL_MA_STRATEGY_SCRIPT,
+                updatedAt: Date.now(),
+            };
+            store.activeId = id;
+            saveUserScriptsStore(store);
+            return store;
+        }
+
+        function compileUserScript(code) {
+            if (!code || !String(code).trim()) {
+                throw new Error('脚本内容不能为空');
+            }
+            const factory = new Function(String(code));
+            const definition = factory();
+            if (!definition || typeof definition !== 'object') {
+                throw new Error('脚本须 return 一个指标/策略定义对象');
+            }
+            if (!definition.id || !definition.name || typeof definition.main !== 'function') {
+                throw new Error('定义对象缺少 id、name 或 main 函数');
+            }
+            if (!Array.isArray(definition.plots) || definition.plots.length === 0) {
+                throw new Error('定义对象须包含至少一个 plots 项');
+            }
+            return definition;
+        }
+
+        function smaFromCloses(closes, length) {
+            if (!closes || closes.length < length) return NaN;
+            const slice = closes.slice(-length);
+            return slice.reduce((sum, v) => sum + v, 0) / length;
+        }
+
+        function simulateDualMaStrategyReturn(bars, fastLen, slowLen) {
+            if (!bars || bars.length < slowLen + 2) return null;
+            let position = 0;
+            let entryPrice = 0;
+            let equity = 1;
+            let prevFast = NaN;
+            let prevSlow = NaN;
+
+            for (let i = 0; i < bars.length; i++) {
+                const closes = bars.slice(0, i + 1).map(b => b.close);
+                const fast = smaFromCloses(closes, fastLen);
+                const slow = smaFromCloses(closes, slowLen);
+
+                if (i > 0 && !Number.isNaN(prevFast) && !Number.isNaN(prevSlow)
+                    && !Number.isNaN(fast) && !Number.isNaN(slow)) {
+                    if (prevFast <= prevSlow && fast > slow && position === 0) {
+                        position = 1;
+                        entryPrice = bars[i].close;
+                    } else if (prevFast >= prevSlow && fast < slow && position === 1) {
+                        equity *= bars[i].close / entryPrice;
+                        position = 0;
+                        entryPrice = 0;
+                    }
+                }
+                prevFast = fast;
+                prevSlow = slow;
+            }
+
+            if (position === 1 && entryPrice > 0) {
+                equity *= bars[bars.length - 1].close / entryPrice;
+            }
+            return (equity - 1) * 100;
+        }
+
+        function getVisibleBarsForBacktest() {
+            const widget = tvWidgets[selectedChartIndex];
+            if (!widget || !widget._ready) return null;
+            try {
+                const chart = widget.activeChart();
+                const symbol = chart.symbol();
+                const resolution = chart.resolution();
+                const key = `${normalizeSymbolInput(symbol).toLowerCase()}_${resolution}`;
+                const store = window.customIndicatorData[key];
+                if (!store) return null;
+                return Object.keys(store)
+                    .map(Number)
+                    .sort((a, b) => a - b)
+                    .map(time => store[time]);
+            } catch (e) {
+                return null;
+            }
+        }
+
+        function updateStrategyPnlDisplay(pnl, label) {
+            const el = document.getElementById('scriptStrategyPnl');
+            if (!el) return;
+            el.classList.remove('is-positive', 'is-negative');
+            if (pnl === null || pnl === undefined || Number.isNaN(pnl)) {
+                el.textContent = `${label || '模拟累计收益率'}: --`;
+                return;
+            }
+            const sign = pnl >= 0 ? '+' : '';
+            el.textContent = `${label || '模拟累计收益率'}: ${sign}${pnl.toFixed(2)}%`;
+            el.classList.add(pnl >= 0 ? 'is-positive' : 'is-negative');
+        }
+
+        function runStrategyBacktestForDefinition(definition) {
+            const bars = getVisibleBarsForBacktest();
+            if (!bars || bars.length === 0) {
+                updateStrategyPnlDisplay(null);
+                return;
+            }
+            const fastLen = Number(definition.inputs?.find(i => i.id === 'fastLen')?.defval) || 5;
+            const slowLen = Number(definition.inputs?.find(i => i.id === 'slowLen')?.defval) || 20;
+            const pnl = simulateDualMaStrategyReturn(bars, fastLen, slowLen);
+            updateStrategyPnlDisplay(pnl);
+            console.log(`[策略回测] ${definition.name} | 屏幕 K 线 ${bars.length} 根 | 模拟累计收益率 ${pnl?.toFixed(2)}%`);
+        }
+
+        function buildPlotStyleDefaults(plot) {
+            if (plot.type === 'shapes') {
+                return {
+                    plottype: plot.shape || 'shape_arrow_up',
+                    location: plot.location || 'BelowBar',
+                    color: plot.color || '#26a69a',
+                    textColor: plot.textColor || '#ffffff',
+                    size: plot.size || 'small',
+                };
+            }
+            if (plot.type === 'histogram') {
+                return {
+                    linestyle: 0,
+                    linewidth: 1,
+                    plottype: 5,
+                    transparency: 0,
+                    color: plot.color || '#2196F3',
+                };
+            }
+            return {
+                linestyle: 0,
+                linewidth: 2,
+                plottype: 0,
+                transparency: 0,
+                color: plot.color || '#2196F3',
+            };
+        }
+
+        function createCustomIndicatorFromDefinition(definition) {
+            const def = definition;
+            const plotCount = def.plots.length;
+
+            return {
+                name: def.name,
+                metainfo: {
+                    _metainfoVersion: 52,
+                    id: def.id,
+                    name: def.name,
+                    description: def.description || def.name,
+                    shortDescription: def.shortDescription || def.name,
+                    is_hidden_study: false,
+                    is_price_study: def.isPriceStudy !== false,
+                    linkedToSeries: def.isPriceStudy !== false,
+                    isCustomIndicator: true,
+                    format: { type: def.isPriceStudy !== false ? 'price' : 'volume', precision: 2 },
+                    inputs: (def.inputs || []).map(input => ({
+                        id: input.id,
+                        name: input.name,
+                        type: input.type || 'integer',
+                        defval: input.defval,
+                        min: input.min,
+                        max: input.max,
+                    })),
+                    plots: def.plots.map(plot => ({
+                        id: plot.id,
+                        type: plot.type === 'shapes' ? 'shapes' : (plot.type || 'line'),
+                    })),
+                    defaults: {
+                        styles: Object.fromEntries(def.plots.map(plot => [plot.id, buildPlotStyleDefaults(plot)])),
+                        inputs: Object.fromEntries((def.inputs || []).map(input => [input.id, input.defval])),
+                    },
+                    styles: Object.fromEntries(def.plots.map(plot => [plot.id, { title: plot.title || plot.id }])),
+                },
+                constructor: function () {
+                    this.init = function (ctx, inp) {
+                        this._context = ctx;
+                        this._input = inp;
+                    };
+                    this.main = function (ctx, inp) {
+                        const { key, store } = getIndicatorBarStore(ctx);
+                        const bars = buildBarsFromStore(store, key);
+                        const currentTime = ctx.symbol.time;
+                        const idx = bars.findIndex(b => b.time === currentTime);
+                        const history = idx >= 0 ? bars.slice(0, idx + 1) : bars;
+
+                        const context = {
+                            time: currentTime,
+                            bar: idx >= 0 ? bars[idx] : null,
+                            bars: history,
+                            isLastBar: idx >= 0 && idx === bars.length - 1,
+                            opens: () => history.map(b => b.open),
+                            highs: () => history.map(b => b.high),
+                            lows: () => history.map(b => b.low),
+                            closes: () => history.map(b => b.close),
+                            volumes: () => history.map(b => b.volume),
+                            input: (name) => inp[name],
+                            reportStrategyPnl: () => {
+                                if (idx >= 0 && idx === bars.length - 1) {
+                                    setTimeout(() => runStrategyBacktestForDefinition(def), 0);
+                                }
+                            },
+                        };
+
+                        const result = def.main(context, inp);
+                        const values = Array.isArray(result) ? result : [result];
+                        while (values.length < plotCount) values.push(NaN);
+                        return values.slice(0, plotCount);
+                    };
+                },
+            };
+        }
+
+        function rebuildUserScriptRegistry() {
+            USER_SCRIPT_REGISTRY.length = 0;
+            const store = seedDefaultUserScriptIfEmpty(loadUserScriptsStore());
+            Object.values(store.scripts).forEach((entry) => {
+                try {
+                    const definition = compileUserScript(entry.code);
+                    USER_SCRIPT_REGISTRY.push(createCustomIndicatorFromDefinition(definition));
+                } catch (e) {
+                    console.warn(`Skip invalid script "${entry.name}":`, e.message);
+                }
+            });
+        }
 
         function getIndicatorBarStore(ctx) {
             const info = ctx.symbol.info;
@@ -2123,73 +2583,294 @@
                 .map(time => ({ time, ...raw[time] }));
         }
 
-        function createCustomIndicator(definition) {
-            return {
-                name: definition.name,
-                metainfo: {
-                    _metainfoVersion: 52,
-                    id: definition.id,
-                    name: definition.name,
-                    description: definition.description,
-                    shortDescription: definition.shortDescription,
-                    is_hidden_study: false,
-                    is_price_study: definition.isPriceStudy,
-                    linkedToSeries: definition.isPriceStudy,
-                    format: { type: definition.isPriceStudy ? 'price' : 'volume' },
-                    inputs: definition.inputs.map(input => ({
-                        id: input.id,
-                        name: input.name,
-                        type: input.type,
-                        defval: input.defval,
-                        min: input.min,
-                        max: input.max
-                    })),
-                    plots: definition.plots.map(plot => ({ id: plot.id, type: plot.type || 'line' })),
-                    defaults: {
-                        styles: Object.fromEntries(definition.plots.map(plot => [plot.id, {
-                            linestyle: 0,
-                            linewidth: 2,
-                            plottype: plot.type === 'histogram' ? 5 : 0,
-                            transparency: 0,
-                            color: plot.color || '#2196F3'
-                        }])),
-                        inputs: Object.fromEntries(definition.inputs.map(input => [input.id, input.defval]))
-                    },
-                    styles: Object.fromEntries(definition.plots.map(plot => [plot.id, { title: plot.title }]))
-                },
-                constructor: function () {
-                    this.init = function (ctx, inp) {
-                        this._context = ctx;
-                        this._input = inp;
-                    };
-                    this.main = function (ctx, inp) {
-                        const { key, store } = getIndicatorBarStore(ctx);
-                        const bars = buildBarsFromStore(store, key);
-                        const currentTime = ctx.symbol.time;
-                        const idx = bars.findIndex(b => b.time === currentTime);
-                        const history = idx >= 0 ? bars.slice(0, idx + 1) : bars;
-
-                        const context = {
-                            time: currentTime,
-                            bar: idx >= 0 ? bars[idx] : null,
-                            bars: history,
-                            opens: () => history.map(b => b.open),
-                            highs: () => history.map(b => b.high),
-                            lows: () => history.map(b => b.low),
-                            closes: () => history.map(b => b.close),
-                            volumes: () => history.map(b => b.volume),
-                            input: (name) => inp[name]
-                        };
-
-                        return definition.calculate(context, inp);
-                    };
-                }
-            };
-        }
-
         function getCustomIndicators(PineJS) {
             window.PineJS = PineJS;
-            return CUSTOM_INDICATOR_REGISTRY.map(createCustomIndicator);
+            rebuildUserScriptRegistry();
+            return USER_SCRIPT_REGISTRY.slice();
+        }
+
+        const ScriptEditorManager = {
+            store: null,
+
+            initStore() {
+                this.store = seedDefaultUserScriptIfEmpty(loadUserScriptsStore());
+                if (!this.store.activeId || !this.store.scripts[this.store.activeId]) {
+                    const firstId = Object.keys(this.store.scripts)[0];
+                    this.store.activeId = firstId || null;
+                }
+                activeScriptId = this.store.activeId;
+                saveUserScriptsStore(this.store);
+            },
+
+            refreshSelector() {
+                const select = document.getElementById('scriptSelector');
+                if (!select) return;
+                const scripts = Object.values(this.store.scripts)
+                    .sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+                select.innerHTML = scripts.map(s =>
+                    `<option value="${escapeHtml(s.id)}"${s.id === activeScriptId ? ' selected' : ''}>${escapeHtml(s.name)}</option>`
+                ).join('');
+            },
+
+            loadScriptToEditor(id) {
+                const entry = this.store.scripts[id];
+                if (!entry || !monacoEditor) return;
+                activeScriptId = id;
+                this.store.activeId = id;
+                saveUserScriptsStore(this.store);
+                monacoEditor.setValue(entry.code);
+                this.refreshSelector();
+                try {
+                    const def = compileUserScript(entry.code);
+                    runStrategyBacktestForDefinition(def);
+                } catch (e) {
+                    updateStrategyPnlDisplay(null);
+                }
+            },
+
+            getCurrentCode() {
+                return monacoEditor ? monacoEditor.getValue() : '';
+            },
+
+            async newScript() {
+                const name = await showInputModal('新建脚本名称', '我的指标策略', '例如：双均线策略');
+                if (!name) return;
+                const slug = name.replace(/[^\w\u4e00-\u9fa5]+/g, '_').slice(0, 24) || 'Script';
+                const id = `User${slug}${Date.now()}@tv-basicstudies-1`;
+                const code = DEFAULT_DUAL_MA_STRATEGY_SCRIPT
+                    .replace('UserDualMAStrategy@tv-basicstudies-1', id)
+                    .replace("'双均线交易策略'", `'${name}'`)
+                    .replace('双均线交易策略', name);
+                this.store.scripts[id] = { id, name, code, updatedAt: Date.now() };
+                this.store.activeId = id;
+                activeScriptId = id;
+                saveUserScriptsStore(this.store);
+                rebuildUserScriptRegistry();
+                this.refreshSelector();
+                if (monacoEditor) monacoEditor.setValue(code);
+            },
+
+            async saveCurrentScript() {
+                const code = this.getCurrentCode();
+                let definition;
+                try {
+                    definition = compileUserScript(code);
+                } catch (e) {
+                    alert(`脚本解析失败：${e.message}`);
+                    return;
+                }
+
+                let id = activeScriptId;
+                let name = definition.name;
+
+                if (!id || !this.store.scripts[id]) {
+                    const inputName = await showInputModal('保存脚本名称', name, '请输入脚本名称');
+                    if (!inputName) return;
+                    name = inputName;
+                    const slug = name.replace(/[^\w\u4e00-\u9fa5]+/g, '_').slice(0, 24) || 'Script';
+                    id = definition.id && this.store.scripts[definition.id]
+                        ? definition.id
+                        : `User${slug}${Date.now()}@tv-basicstudies-1`;
+                }
+
+                definition.id = id;
+                definition.name = name;
+
+                this.store.scripts[id] = {
+                    id,
+                    name,
+                    code: this.getCurrentCode(),
+                    updatedAt: Date.now(),
+                };
+                this.store.activeId = id;
+                activeScriptId = id;
+                saveUserScriptsStore(this.store);
+                rebuildUserScriptRegistry();
+                this.refreshSelector();
+                alert(`脚本「${name}」已保存`);
+            },
+
+            async applyToChart() {
+                const code = this.getCurrentCode();
+                let definition;
+                try {
+                    definition = compileUserScript(code);
+                } catch (e) {
+                    alert(`无法应用：${e.message}`);
+                    return;
+                }
+
+                if (activeScriptId) {
+                    definition.id = activeScriptId;
+                    this.store.scripts[activeScriptId] = {
+                        id: activeScriptId,
+                        name: definition.name,
+                        code,
+                        updatedAt: Date.now(),
+                    };
+                    this.store.activeId = activeScriptId;
+                    saveUserScriptsStore(this.store);
+                }
+
+                rebuildUserScriptRegistry();
+                pendingApplyStudyName = definition.name;
+                runStrategyBacktestForDefinition(definition);
+
+                const widget = tvWidgets[selectedChartIndex];
+                if (!widget || !widget._ready) {
+                    alert('图表尚未就绪，请稍后再试');
+                    return;
+                }
+
+                try {
+                    const studyResult = widget.activeChart().createStudy(definition.name, false, false);
+                    if (studyResult && typeof studyResult.then === 'function') {
+                        await studyResult;
+                    }
+                    pendingApplyStudyName = null;
+                } catch (e) {
+                    console.warn('createStudy failed, reloading widget:', e);
+                    await reloadWidgetForScripts(selectedChartIndex, definition.name);
+                }
+            },
+
+            bindEvents() {
+                document.getElementById('btnNewScript')?.addEventListener('click', () => this.newScript());
+                document.getElementById('btnSaveScript')?.addEventListener('click', () => this.saveCurrentScript());
+                document.getElementById('btnApplyScript')?.addEventListener('click', () => this.applyToChart());
+                document.getElementById('scriptSelector')?.addEventListener('change', (e) => {
+                    this.loadScriptToEditor(e.target.value);
+                });
+            },
+
+            initMonacoEditor() {
+                return new Promise((resolve, reject) => {
+                    if (typeof require === 'undefined') {
+                        reject(new Error('Monaco loader unavailable'));
+                        return;
+                    }
+                    require.config({
+                        paths: { vs: 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/min/vs' },
+                    });
+                    require(['vs/editor/editor.main'], () => {
+                        const container = document.getElementById('monacoEditorContainer');
+                        if (!container) {
+                            reject(new Error('Monaco container missing'));
+                            return;
+                        }
+                        const initial = activeScriptId && this.store.scripts[activeScriptId]
+                            ? this.store.scripts[activeScriptId].code
+                            : DEFAULT_DUAL_MA_STRATEGY_SCRIPT;
+                        monacoEditor = monaco.editor.create(container, {
+                            value: initial,
+                            language: 'javascript',
+                            theme: 'vs-dark',
+                            automaticLayout: true,
+                            minimap: { enabled: false },
+                            fontSize: 13,
+                            scrollBeyondLastLine: false,
+                            wordWrap: 'on',
+                            tabSize: 4,
+                        });
+                        resolve();
+                    }, reject);
+                });
+            },
+
+            initResizer() {
+                const resizer = document.getElementById('scriptEditorResizer');
+                const panel = document.getElementById('scriptEditorPanel');
+                if (!resizer || !panel) return;
+
+                let dragging = false;
+                let startY = 0;
+                let startHeight = 0;
+
+                resizer.addEventListener('mousedown', (e) => {
+                    dragging = true;
+                    startY = e.clientY;
+                    startHeight = panel.getBoundingClientRect().height;
+                    document.body.classList.add('script-resizing');
+                    e.preventDefault();
+                });
+
+                document.addEventListener('mousemove', (e) => {
+                    if (!dragging) return;
+                    const delta = startY - e.clientY;
+                    const next = Math.min(window.innerHeight * 0.55, Math.max(120, startHeight + delta));
+                    panel.style.height = `${next}px`;
+                });
+
+                document.addEventListener('mouseup', () => {
+                    if (!dragging) return;
+                    dragging = false;
+                    document.body.classList.remove('script-resizing');
+                });
+            },
+
+            async init() {
+                this.initStore();
+                rebuildUserScriptRegistry();
+                this.refreshSelector();
+                this.bindEvents();
+                this.initResizer();
+                try {
+                    await this.initMonacoEditor();
+                    if (activeScriptId) {
+                        try {
+                            runStrategyBacktestForDefinition(compileUserScript(this.getCurrentCode()));
+                        } catch (e) { /* ignore */ }
+                    }
+                } catch (e) {
+                    console.error('Monaco Editor init failed:', e);
+                }
+            },
+        };
+
+        async function reloadWidgetForScripts(index, studyName) {
+            const oldWidget = tvWidgets[index];
+            if (!oldWidget) return;
+            let symbol = getChartActiveSymbol();
+            let interval = '1D';
+            try {
+                symbol = oldWidget.activeChart().symbol();
+                interval = oldWidget.activeChart().resolution();
+            } catch (e) { /* use defaults */ }
+
+            try {
+                oldWidget.remove();
+            } catch (e) { /* ignore */ }
+
+            pendingApplyStudyName = studyName;
+            createWidget(index, symbol, interval);
+            selectChart(index);
+
+            const waitReady = () => new Promise((resolve) => {
+                const widget = tvWidgets[index];
+                if (!widget) return resolve(false);
+                if (widget._ready) return resolve(true);
+                const started = Date.now();
+                const timer = setInterval(() => {
+                    if (widget._ready || Date.now() - started > 15000) {
+                        clearInterval(timer);
+                        resolve(!!widget._ready);
+                    }
+                }, 200);
+            });
+
+            const ready = await waitReady();
+            if (ready && studyName) {
+                try {
+                    await tvWidgets[index].activeChart().createStudy(studyName, false, false);
+                } catch (e) {
+                    console.warn('Failed to auto-apply study after reload:', e);
+                }
+            }
+            pendingApplyStudyName = null;
+        }
+
+        async function initScriptEditor() {
+            await ScriptEditorManager.init();
         }
 
         // ============ UI Functions ============
@@ -2670,14 +3351,14 @@
             });
         }
 
-        function createWidget(index, customSymbol = null) {
+        function createWidget(index, customSymbol = null, customInterval = null) {
             const symbol = (customSymbol || getChartActiveSymbol()).toLowerCase();
             saveChartActiveSymbol(symbol);
             onActiveChartSymbolChanged(symbol);
 
             const widget = new TradingView.widget({
                 symbol: symbol,
-                interval: "1D",
+                interval: customInterval || "1D",
                 container: `chart_${index}`,
                 datafeed: new CustomDatafeed(getApiBaseUrl()),
                 library_path: "charting_library/",
@@ -2701,6 +3382,8 @@
                     "header_settings",
                     "chart_property_page",
                     "show_chart_property_page",
+                    "property_pages",
+                    "edit_buttons_in_legend",
                 ],
                 disabled_features: [],
                 favorites: {
@@ -2799,6 +3482,25 @@
                 }
 
                 widget._ready = true;
+
+                if (pendingApplyStudyName) {
+                    const studyName = pendingApplyStudyName;
+                    pendingApplyStudyName = null;
+                    setTimeout(() => {
+                        try {
+                            widget.activeChart().createStudy(studyName, false, false);
+                        } catch (e) {
+                            console.warn('Auto apply study failed:', e);
+                        }
+                    }, 500);
+                }
+
+                setTimeout(() => {
+                    try {
+                        const code = ScriptEditorManager.getCurrentCode();
+                        runStrategyBacktestForDefinition(compileUserScript(code));
+                    } catch (e) { /* ignore */ }
+                }, 1500);
             });
 
             tvWidgets[index] = widget;
@@ -2959,6 +3661,9 @@
         async function init() {
             // Load supported symbols from backend
             await watchlistManager.initFromBackend();
+
+            // Script editor + user indicators (must run before chart widget)
+            await initScriptEditor();
 
             // Initialize watchlist
             initWatchlistEvents();
