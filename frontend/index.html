@@ -2336,7 +2336,7 @@
         const USER_SCRIPT_REGISTRY = [];
         let monacoEditor = null;
         let activeScriptId = null;
-        let pendingApplyStudyName = null;
+        let pendingApplyStudy = false;
 
         const DEFAULT_DUAL_MA_STRATEGY_SCRIPT = `// ========== 双均线交易策略模板（指标 + 策略信号）==========
 // 修改 main 逻辑后点击【应用到图表】，指标线与买卖箭头将实时渲染到 K 线图
@@ -2540,10 +2540,48 @@ return {
             return idx;
         }
 
-        function getStudyCreateName(indicator) {
-            return indicator.metainfo?.description
-                || indicator.metainfo?.name
-                || indicator.name;
+        function extractStudyDescriptionFromCode(code) {
+            const src = String(code || '');
+            if (!src.trim()) return null;
+
+            const patterns = [
+                /metainfo\s*:\s*\{[\s\S]*?\bdescription\s*:\s*['"]([^'"]*)['"]/,
+                /\bdescription\s*:\s*['"]([^'"]*)['"]/,
+                /\bdescription\s*:\s*`([^`]*)`/,
+            ];
+            for (const re of patterns) {
+                const m = src.match(re);
+                if (m && m[1] != null && String(m[1]).trim() !== '') {
+                    return String(m[1]);
+                }
+            }
+            return null;
+        }
+
+        function getEditorStudyDescription() {
+            const code = (typeof ScriptEditorManager !== 'undefined' && ScriptEditorManager.getCurrentCode)
+                ? ScriptEditorManager.getCurrentCode()
+                : (monacoEditor ? monacoEditor.getValue() : '');
+            return extractStudyDescriptionFromCode(code);
+        }
+
+        function applyStudyFromEditor(widget) {
+            const studyName = getEditorStudyDescription();
+            if (!studyName) {
+                console.warn('createStudy: 编辑器代码中未找到 description 字段');
+                return false;
+            }
+            try {
+                const result = widget.activeChart().createStudy(studyName, false, false);
+                if (result && typeof result.then === 'function') {
+                    result.catch((e) => console.warn('createStudy failed:', studyName, e));
+                }
+                console.log('createStudy:', studyName);
+                return true;
+            } catch (e) {
+                console.warn('createStudy failed:', studyName, e);
+                return false;
+            }
         }
 
         function compileUserScript(code, PineJS) {
@@ -2561,9 +2599,21 @@ return {
                 throw new Error('定义对象须包含至少一个 plots 项');
             }
             if (!raw.id) raw.id = `${String(raw.name).replace(/\s+/g, '')}@tv-basicstudies-1`;
+            const extractedDesc = extractStudyDescriptionFromCode(code);
+            if (extractedDesc) raw.description = extractedDesc;
             if (!raw.description) raw.description = raw.name;
             if (!raw.shortDescription) raw.shortDescription = raw.description;
             return raw;
+        }
+
+        function syncIndicatorDescriptionFromCode(indicator, code) {
+            const extractedDesc = extractStudyDescriptionFromCode(code);
+            if (!extractedDesc || !indicator?.metainfo) return indicator;
+            indicator.metainfo.description = extractedDesc;
+            if (!indicator.metainfo.shortDescription) {
+                indicator.metainfo.shortDescription = extractedDesc;
+            }
+            return indicator;
         }
 
         function parseScriptToCustomIndicator(code, PineJS) {
@@ -2581,10 +2631,10 @@ return {
                 }
                 raw.metainfo.isCustomIndicator = true;
                 raw.metainfo._metainfoVersion = raw.metainfo._metainfoVersion || 52;
-                return raw;
+                return syncIndicatorDescriptionFromCode(raw, code);
             }
 
-            return createCustomIndicatorFromDefinition(raw);
+            return syncIndicatorDescriptionFromCode(createCustomIndicatorFromDefinition(raw), code);
         }
 
         function loadCustomIndicatorsFromStorage(PineJS) {
@@ -3030,33 +3080,38 @@ return {
 
             async applyToChart() {
                 const code = this.getCurrentCode();
-                let indicator;
+                const studyName = extractStudyDescriptionFromCode(code);
+                if (!studyName) {
+                    alert('请在脚本中设置 description: "你的指标名"（createStudy 将使用该名称）');
+                    return;
+                }
+
                 try {
-                    indicator = parseScriptToCustomIndicator(code, window.PineJS || null);
+                    parseScriptToCustomIndicator(code, window.PineJS || null);
                 } catch (e) {
                     alert(`无法应用：${e.message}`);
                     return;
                 }
 
-                const studyName = getStudyCreateName(indicator);
                 const definition = compileUserScript(code, window.PineJS || null);
 
                 if (activeScriptId) {
                     this.store.scripts[activeScriptId] = {
                         id: activeScriptId,
-                        name: definition.name || studyName,
+                        name: studyName,
                         code,
                         updatedAt: Date.now(),
                     };
                     this.store.activeId = activeScriptId;
                     saveUserScriptsStore(this.store);
+                    this.updateActiveName();
                 }
 
                 rebuildUserScriptRegistry(window.PineJS || null);
                 runStrategyBacktestForDefinition(definition);
 
-                pendingApplyStudyName = studyName;
-                await reloadWidgetForScripts(selectedChartIndex, studyName);
+                pendingApplyStudy = true;
+                await reloadWidgetForScripts(selectedChartIndex);
             },
 
             bindEvents() {
@@ -3181,7 +3236,7 @@ return {
             },
         };
 
-        async function reloadWidgetForScripts(index, studyName) {
+        async function reloadWidgetForScripts(index) {
             const oldWidget = tvWidgets[index];
             if (!oldWidget) return;
             let symbol = getChartActiveSymbol();
@@ -3195,7 +3250,7 @@ return {
                 oldWidget.remove();
             } catch (e) { /* ignore */ }
 
-            pendingApplyStudyName = studyName;
+            pendingApplyStudy = true;
             createWidget(index, symbol, interval);
             selectChart(index);
 
@@ -3212,18 +3267,7 @@ return {
                 }, 200);
             });
 
-            const ready = await waitReady();
-            if (ready && studyName) {
-                try {
-                    const result = tvWidgets[index].activeChart().createStudy(studyName, false, false);
-                    if (result && typeof result.then === 'function') {
-                        await result;
-                    }
-                } catch (e) {
-                    console.warn('Failed to auto-apply study after reload:', e);
-                }
-            }
-            pendingApplyStudyName = null;
+            await waitReady();
         }
 
         async function initScriptEditor() {
@@ -3861,19 +3905,9 @@ return {
                 setTimeout(() => syncChartTheme(widget), 300);
                 setTimeout(() => syncChartTheme(widget), 1200);
 
-                if (pendingApplyStudyName) {
-                    const studyName = pendingApplyStudyName;
-                    pendingApplyStudyName = null;
-                    setTimeout(() => {
-                        try {
-                            const result = widget.activeChart().createStudy(studyName, false, false);
-                            if (result && typeof result.then === 'function') {
-                                result.catch((e) => console.warn('Auto apply study failed:', e));
-                            }
-                        } catch (e) {
-                            console.warn('Auto apply study failed:', e);
-                        }
-                    }, 500);
+                if (pendingApplyStudy) {
+                    pendingApplyStudy = false;
+                    setTimeout(() => applyStudyFromEditor(widget), 500);
                 }
 
                 setTimeout(() => {
