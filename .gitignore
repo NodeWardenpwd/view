@@ -10,3 +10,7 @@ tradingview-demo
 backend/.env
 
 /frontend/.env
+
+*.7z
+*.zip
+*.rar

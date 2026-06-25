@@ -59,6 +59,83 @@
             background: #0F0F0F;
         }
 
+        .script-editor-dock {
+            flex-shrink: 0;
+            display: flex;
+            flex-direction: column;
+            background: #131722;
+            border-top: 1px solid #2a2e39;
+        }
+
+        .script-editor-dock.is-collapsed .script-editor-resizer,
+        .script-editor-dock.is-collapsed .script-editor-panel {
+            display: none;
+        }
+
+        .script-editor-header {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 0 10px;
+            height: 36px;
+            flex-shrink: 0;
+            cursor: pointer;
+            user-select: none;
+            background: #131722;
+        }
+
+        .script-editor-header:hover {
+            background: #1e222d;
+        }
+
+        .script-collapse-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            width: 28px;
+            height: 28px;
+            padding: 0;
+            border: none;
+            border-radius: 4px;
+            background: transparent;
+            color: #787b86;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+
+        .script-collapse-btn:hover {
+            background: #2a2e39;
+            color: #d1d4dc;
+        }
+
+        .script-collapse-btn svg {
+            transition: transform 0.2s ease;
+        }
+
+        .script-editor-dock.is-collapsed .script-collapse-btn svg {
+            transform: rotate(180deg);
+        }
+
+        .script-editor-title {
+            font-size: 13px;
+            font-weight: 500;
+            color: #d1d4dc;
+            flex-shrink: 0;
+        }
+
+        .script-editor-active-name {
+            font-size: 12px;
+            color: #787b86;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .script-editor-header .toolbar-spacer {
+            flex: 1;
+        }
+
         .script-editor-resizer {
             height: 5px;
             cursor: row-resize;
@@ -129,6 +206,16 @@
         .script-btn-primary:hover {
             background: #1e53e5;
             border-color: #1e53e5;
+        }
+
+        .script-btn-danger {
+            border-color: #5c2b2b;
+            color: #ef5350;
+        }
+
+        .script-btn-danger:hover {
+            background: rgba(239, 83, 80, 0.12);
+            border-color: #ef5350;
         }
 
         .script-select {
@@ -1025,20 +1112,32 @@
             <div id="tv_chart_container" class="charts-layout layout-single">
                 <div class="chart-cell" id="chart_0"></div>
             </div>
-            <div class="script-editor-resizer" id="scriptEditorResizer"></div>
-            <div class="script-editor-panel" id="scriptEditorPanel">
-                <div class="script-editor-toolbar">
-                    <div class="toolbar-group">
-                        <select class="script-select" id="scriptSelector" title="已保存脚本"></select>
-                        <button type="button" class="script-btn" id="btnNewScript">新建脚本</button>
-                        <button type="button" class="script-btn" id="btnSaveScript">保存脚本</button>
-                        <button type="button" class="script-btn script-btn-primary" id="btnApplyScript">应用到图表</button>
-                    </div>
+            <div class="script-editor-dock" id="scriptEditorDock">
+                <div class="script-editor-header" id="scriptEditorHeader" title="点击收起/展开">
+                    <button type="button" class="script-collapse-btn" id="btnToggleScriptPanel" title="收起/展开">
+                        <svg width="14" height="14" viewBox="0 0 16 16" fill="currentColor">
+                            <path fill-rule="evenodd" d="M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708z"/>
+                        </svg>
+                    </button>
+                    <span class="script-editor-title">指标 / 策略编辑器</span>
+                    <span class="script-editor-active-name" id="scriptActiveName"></span>
                     <div class="toolbar-spacer"></div>
                     <div class="script-strategy-pnl" id="scriptStrategyPnl">模拟累计收益率: --</div>
                 </div>
-                <div class="script-editor-body">
-                    <div id="monacoEditorContainer"></div>
+                <div class="script-editor-resizer" id="scriptEditorResizer"></div>
+                <div class="script-editor-panel" id="scriptEditorPanel">
+                    <div class="script-editor-toolbar">
+                        <div class="toolbar-group">
+                            <select class="script-select" id="scriptSelector" title="已保存脚本"></select>
+                            <button type="button" class="script-btn" id="btnNewScript">新建脚本</button>
+                            <button type="button" class="script-btn" id="btnSaveScript">保存脚本</button>
+                            <button type="button" class="script-btn script-btn-danger" id="btnDeleteScript">删除脚本</button>
+                            <button type="button" class="script-btn script-btn-primary" id="btnApplyScript">应用到图表</button>
+                        </div>
+                    </div>
+                    <div class="script-editor-body">
+                        <div id="monacoEditorContainer"></div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -2232,6 +2331,7 @@
         // ============ 用户脚本 / 指标策略编辑器 ============
 
         const USER_SCRIPTS_STORAGE_KEY = 'tv_user_scripts_v1';
+        const SCRIPT_PANEL_COLLAPSED_KEY = 'tv_script_panel_collapsed';
         const USER_SCRIPT_REGISTRY = [];
         let monacoEditor = null;
         let activeScriptId = null;
@@ -2591,6 +2691,8 @@ return {
 
         const ScriptEditorManager = {
             store: null,
+            collapsed: false,
+            savedPanelHeight: 280,
 
             initStore() {
                 this.store = seedDefaultUserScriptIfEmpty(loadUserScriptsStore());
@@ -2610,6 +2712,54 @@ return {
                 select.innerHTML = scripts.map(s =>
                     `<option value="${escapeHtml(s.id)}"${s.id === activeScriptId ? ' selected' : ''}>${escapeHtml(s.name)}</option>`
                 ).join('');
+                this.updateActiveName();
+            },
+
+            updateActiveName() {
+                const el = document.getElementById('scriptActiveName');
+                if (!el) return;
+                const entry = activeScriptId ? this.store.scripts[activeScriptId] : null;
+                el.textContent = entry ? entry.name : '';
+            },
+
+            setCollapsed(collapsed, persist = true) {
+                this.collapsed = collapsed;
+                const dock = document.getElementById('scriptEditorDock');
+                const panel = document.getElementById('scriptEditorPanel');
+                const toggleBtn = document.getElementById('btnToggleScriptPanel');
+                if (!dock) return;
+
+                if (!collapsed && panel) {
+                    panel.style.height = `${this.savedPanelHeight}px`;
+                } else if (collapsed && panel) {
+                    const currentHeight = panel.getBoundingClientRect().height;
+                    if (currentHeight >= 120) {
+                        this.savedPanelHeight = currentHeight;
+                    }
+                }
+
+                dock.classList.toggle('is-collapsed', collapsed);
+                if (toggleBtn) {
+                    toggleBtn.title = collapsed ? '展开编辑器' : '收起编辑器';
+                }
+                if (persist) {
+                    localStorage.setItem(SCRIPT_PANEL_COLLAPSED_KEY, collapsed ? '1' : '0');
+                }
+
+                if (!collapsed && monacoEditor) {
+                    setTimeout(() => {
+                        try { monacoEditor.layout(); } catch (e) { /* ignore */ }
+                    }, 80);
+                }
+            },
+
+            toggleCollapsed() {
+                this.setCollapsed(!this.collapsed);
+            },
+
+            loadCollapsedPreference() {
+                const saved = localStorage.getItem(SCRIPT_PANEL_COLLAPSED_KEY);
+                this.setCollapsed(saved === '1', false);
             },
 
             loadScriptToEditor(id) {
@@ -2690,6 +2840,40 @@ return {
                 alert(`脚本「${name}」已保存`);
             },
 
+            async deleteCurrentScript() {
+                if (!activeScriptId || !this.store.scripts[activeScriptId]) {
+                    alert('没有可删除的脚本');
+                    return;
+                }
+
+                const entry = this.store.scripts[activeScriptId];
+                if (!confirm(`确定删除脚本「${entry.name}」？\n删除后无法恢复。`)) {
+                    return;
+                }
+
+                delete this.store.scripts[activeScriptId];
+
+                const remainingIds = Object.keys(this.store.scripts);
+                if (remainingIds.length === 0) {
+                    this.store = seedDefaultUserScriptIfEmpty({ activeId: null, scripts: {} });
+                } else {
+                    this.store.activeId = remainingIds[0];
+                }
+
+                activeScriptId = this.store.activeId;
+                saveUserScriptsStore(this.store);
+                rebuildUserScriptRegistry();
+                this.refreshSelector();
+
+                if (activeScriptId) {
+                    this.loadScriptToEditor(activeScriptId);
+                } else if (monacoEditor) {
+                    monacoEditor.setValue(DEFAULT_DUAL_MA_STRATEGY_SCRIPT);
+                }
+
+                updateStrategyPnlDisplay(null);
+            },
+
             async applyToChart() {
                 const code = this.getCurrentCode();
                 let definition;
@@ -2735,12 +2919,35 @@ return {
             },
 
             bindEvents() {
-                document.getElementById('btnNewScript')?.addEventListener('click', () => this.newScript());
-                document.getElementById('btnSaveScript')?.addEventListener('click', () => this.saveCurrentScript());
-                document.getElementById('btnApplyScript')?.addEventListener('click', () => this.applyToChart());
+                document.getElementById('btnNewScript')?.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.newScript();
+                });
+                document.getElementById('btnSaveScript')?.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.saveCurrentScript();
+                });
+                document.getElementById('btnDeleteScript')?.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.deleteCurrentScript();
+                });
+                document.getElementById('btnApplyScript')?.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.applyToChart();
+                });
                 document.getElementById('scriptSelector')?.addEventListener('change', (e) => {
+                    e.stopPropagation();
                     this.loadScriptToEditor(e.target.value);
                 });
+                document.getElementById('scriptSelector')?.addEventListener('click', (e) => e.stopPropagation());
+
+                const header = document.getElementById('scriptEditorHeader');
+                const toggleBtn = document.getElementById('btnToggleScriptPanel');
+                toggleBtn?.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.toggleCollapsed();
+                });
+                header?.addEventListener('click', () => this.toggleCollapsed());
             },
 
             initMonacoEditor() {
@@ -2787,6 +2994,7 @@ return {
                 let startHeight = 0;
 
                 resizer.addEventListener('mousedown', (e) => {
+                    if (this.collapsed) return;
                     dragging = true;
                     startY = e.clientY;
                     startHeight = panel.getBoundingClientRect().height;
@@ -2795,16 +3003,20 @@ return {
                 });
 
                 document.addEventListener('mousemove', (e) => {
-                    if (!dragging) return;
+                    if (!dragging || this.collapsed) return;
                     const delta = startY - e.clientY;
                     const next = Math.min(window.innerHeight * 0.55, Math.max(120, startHeight + delta));
                     panel.style.height = `${next}px`;
+                    this.savedPanelHeight = next;
                 });
 
                 document.addEventListener('mouseup', () => {
                     if (!dragging) return;
                     dragging = false;
                     document.body.classList.remove('script-resizing');
+                    if (monacoEditor) {
+                        try { monacoEditor.layout(); } catch (e) { /* ignore */ }
+                    }
                 });
             },
 
@@ -2814,6 +3026,7 @@ return {
                 this.refreshSelector();
                 this.bindEvents();
                 this.initResizer();
+                this.loadCollapsedPreference();
                 try {
                     await this.initMonacoEditor();
                     if (activeScriptId) {
