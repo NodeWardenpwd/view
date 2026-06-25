@@ -2333,6 +2333,7 @@
 
         const USER_SCRIPTS_STORAGE_KEY = 'tv_user_scripts_v1';
         const SCRIPT_PANEL_COLLAPSED_KEY = 'tv_script_panel_collapsed';
+        const APPLIED_STUDY_KEY = 'tv_applied_study_v1';
         const USER_SCRIPT_REGISTRY = [];
         let monacoEditor = null;
         let activeScriptId = null;
@@ -2544,18 +2545,53 @@ return {
             const src = String(code || '');
             if (!src.trim()) return null;
 
-            const patterns = [
-                /metainfo\s*:\s*\{[\s\S]*?\bdescription\s*:\s*['"]([^'"]*)['"]/,
-                /\bdescription\s*:\s*['"]([^'"]*)['"]/,
-                /\bdescription\s*:\s*`([^`]*)`/,
-            ];
-            for (const re of patterns) {
-                const m = src.match(re);
-                if (m && m[1] != null && String(m[1]).trim() !== '') {
-                    return String(m[1]);
-                }
+            try {
+                const obj = executeUserScript(src, null);
+                if (obj?.description) return String(obj.description);
+                if (obj?.metainfo?.description) return String(obj.metainfo.description);
+            } catch (e) { /* fall through to text scan */ }
+
+            const m = src.match(/\bdescription\s*:\s*['"`]([^'"`]+)['"`]/);
+            return m && m[1] ? String(m[1]) : null;
+        }
+
+        function forceAlignStudyIdentity(studyDef, desc) {
+            if (!studyDef || !desc) return studyDef;
+            if (!studyDef.metainfo) studyDef.metainfo = {};
+
+            studyDef.id = desc;
+            studyDef.name = desc;
+            studyDef.metainfo.id = `${desc}@tv-basicstudies-1`;
+            studyDef.metainfo.description = desc;
+            studyDef.metainfo.name = desc;
+            studyDef.metainfo.shortDescription = desc;
+            studyDef.metainfo.isCustomIndicator = true;
+            studyDef.metainfo._metainfoVersion = studyDef.metainfo._metainfoVersion || 52;
+            return studyDef;
+        }
+
+        function saveAppliedStudy(description, scriptId) {
+            if (!description) return;
+            localStorage.setItem(APPLIED_STUDY_KEY, JSON.stringify({
+                description,
+                scriptId: scriptId || null,
+                updatedAt: Date.now(),
+            }));
+        }
+
+        function getAppliedStudyDescription() {
+            try {
+                const raw = localStorage.getItem(APPLIED_STUDY_KEY);
+                if (!raw) return null;
+                const parsed = JSON.parse(raw);
+                return parsed.description || null;
+            } catch (e) {
+                return null;
             }
-            return null;
+        }
+
+        function clearAppliedStudy() {
+            localStorage.removeItem(APPLIED_STUDY_KEY);
         }
 
         function getEditorStudyDescription() {
@@ -2565,10 +2601,14 @@ return {
             return extractStudyDescriptionFromCode(code);
         }
 
+        function resolveStudyCreateName() {
+            return getEditorStudyDescription() || getAppliedStudyDescription();
+        }
+
         function applyStudyFromEditor(widget) {
-            const studyName = getEditorStudyDescription();
+            const studyName = resolveStudyCreateName();
             if (!studyName) {
-                console.warn('createStudy: 编辑器代码中未找到 description 字段');
+                console.warn('createStudy: 未找到 description');
                 return false;
             }
             try {
@@ -2582,6 +2622,46 @@ return {
                 console.warn('createStudy failed:', studyName, e);
                 return false;
             }
+        }
+
+        function buildCustomIndicators(PineJS) {
+            const store = seedDefaultUserScriptIfEmpty(loadUserScriptsStore());
+            const indicators = [];
+            const seen = new Set();
+
+            for (const entry of Object.values(store.scripts)) {
+                try {
+                    const desc = extractStudyDescriptionFromCode(entry.code);
+                    if (!desc) {
+                        console.warn('跳过无 description 的脚本:', entry.name);
+                        continue;
+                    }
+
+                    let studyDef;
+                    try {
+                        const scriptFunc = new Function('PineJS', entry.code);
+                        studyDef = scriptFunc(PineJS);
+                    } catch (e) {
+                        studyDef = null;
+                    }
+
+                    if (!studyDef || typeof studyDef !== 'object') {
+                        studyDef = createCustomIndicatorFromDefinition(compileUserScript(entry.code, PineJS));
+                    } else if (!(studyDef.metainfo && studyDef.constructor)) {
+                        studyDef = createCustomIndicatorFromDefinition(compileUserScript(entry.code, PineJS));
+                    }
+
+                    forceAlignStudyIdentity(studyDef, desc);
+
+                    if (seen.has(studyDef.metainfo.id)) continue;
+                    seen.add(studyDef.metainfo.id);
+                    indicators.push(studyDef);
+                } catch (e) {
+                    console.error('解析用户指标失败:', entry.name, e);
+                }
+            }
+
+            return indicators;
         }
 
         function compileUserScript(code, PineJS) {
@@ -2606,55 +2686,23 @@ return {
             return raw;
         }
 
-        function syncIndicatorDescriptionFromCode(indicator, code) {
-            const extractedDesc = extractStudyDescriptionFromCode(code);
-            if (!extractedDesc || !indicator?.metainfo) return indicator;
-            indicator.metainfo.description = extractedDesc;
-            if (!indicator.metainfo.shortDescription) {
-                indicator.metainfo.shortDescription = extractedDesc;
-            }
-            return indicator;
-        }
-
         function parseScriptToCustomIndicator(code, PineJS) {
             const raw = compileUserScript(code, PineJS);
+            let studyDef;
 
             if (raw.metainfo && raw.constructor) {
-                if (!raw.name) {
-                    raw.name = raw.metainfo.id || raw.metainfo.description || 'CustomStudy';
-                }
-                if (!raw.metainfo.description) {
-                    raw.metainfo.description = raw.metainfo.name || raw.name;
-                }
-                if (!raw.metainfo.id) {
-                    raw.metainfo.id = `${raw.name}@tv-basicstudies-1`;
-                }
-                raw.metainfo.isCustomIndicator = true;
-                raw.metainfo._metainfoVersion = raw.metainfo._metainfoVersion || 52;
-                return syncIndicatorDescriptionFromCode(raw, code);
+                studyDef = raw;
+            } else {
+                studyDef = createCustomIndicatorFromDefinition(raw);
             }
 
-            return syncIndicatorDescriptionFromCode(createCustomIndicatorFromDefinition(raw), code);
+            const desc = extractStudyDescriptionFromCode(code);
+            if (desc) forceAlignStudyIdentity(studyDef, desc);
+            return studyDef;
         }
 
         function loadCustomIndicatorsFromStorage(PineJS) {
-            const indicators = [];
-            const seen = new Set();
-            const store = seedDefaultUserScriptIfEmpty(loadUserScriptsStore());
-
-            Object.values(store.scripts).forEach((entry) => {
-                try {
-                    const indicator = parseScriptToCustomIndicator(entry.code, PineJS);
-                    const key = indicator.metainfo?.id || indicator.name;
-                    if (seen.has(key)) return;
-                    seen.add(key);
-                    indicators.push(indicator);
-                } catch (e) {
-                    console.error('解析用户指标失败:', entry.name, e);
-                }
-            });
-
-            return indicators;
+            return buildCustomIndicators(PineJS);
         }
 
         function normalizeIntervalKey(resolution) {
@@ -2883,7 +2931,7 @@ return {
 
         function rebuildUserScriptRegistry(PineJS) {
             USER_SCRIPT_REGISTRY.length = 0;
-            loadCustomIndicatorsFromStorage(PineJS || window.PineJS || null)
+            buildCustomIndicators(PineJS || window.PineJS || null)
                 .forEach((indicator) => USER_SCRIPT_REGISTRY.push(indicator));
         }
 
@@ -3076,6 +3124,7 @@ return {
                 }
 
                 updateStrategyPnlDisplay(null);
+                clearAppliedStudy();
             },
 
             async applyToChart() {
@@ -3110,6 +3159,7 @@ return {
                 rebuildUserScriptRegistry(window.PineJS || null);
                 runStrategyBacktestForDefinition(definition);
 
+                saveAppliedStudy(studyName, activeScriptId);
                 pendingApplyStudy = true;
                 await reloadWidgetForScripts(selectedChartIndex);
             },
@@ -3789,7 +3839,7 @@ return {
                 auto_save_delay: 5,
                 custom_indicators_getter: function (PineJS) {
                     window.PineJS = PineJS;
-                    const indicators = loadCustomIndicatorsFromStorage(PineJS);
+                    const indicators = buildCustomIndicators(PineJS);
                     return Promise.resolve(indicators);
                 },
                 enabled_features: [
@@ -3905,7 +3955,7 @@ return {
                 setTimeout(() => syncChartTheme(widget), 300);
                 setTimeout(() => syncChartTheme(widget), 1200);
 
-                if (pendingApplyStudy) {
+                if (pendingApplyStudy || getAppliedStudyDescription()) {
                     pendingApplyStudy = false;
                     setTimeout(() => applyStudyFromEditor(widget), 500);
                 }
@@ -4118,6 +4168,9 @@ return {
             // Initialize with persisted active symbol
             if (watchlistManager) {
                 watchlistManager.selectedSymbol = getChartActiveSymbol();
+            }
+            if (getAppliedStudyDescription()) {
+                pendingApplyStudy = true;
             }
             createWidget(0, getChartActiveSymbol());
             selectChart(0);
