@@ -833,6 +833,70 @@
             background: #a0a4ac;
         }
 
+        html.theme-light .script-editor-dock,
+        html.theme-light .script-editor-header {
+            background: #ffffff;
+            border-top-color: #e0e3eb;
+        }
+
+        html.theme-light .script-editor-header:hover {
+            background: #f0f3fa;
+        }
+
+        html.theme-light .script-editor-panel {
+            background: #ffffff;
+            border-top-color: #e0e3eb;
+        }
+
+        html.theme-light .script-editor-toolbar {
+            background: #f0f3fa;
+            border-bottom-color: #e0e3eb;
+        }
+
+        html.theme-light .script-editor-title {
+            color: #131722;
+        }
+
+        html.theme-light .script-editor-active-name,
+        html.theme-light .script-strategy-pnl {
+            color: #6a6d78;
+        }
+
+        html.theme-light .script-btn {
+            background: #ffffff;
+            border-color: #e0e3eb;
+            color: #131722;
+        }
+
+        html.theme-light .script-btn:hover {
+            background: #f0f3fa;
+            border-color: #d1d4dc;
+        }
+
+        html.theme-light .script-select {
+            background: #ffffff;
+            border-color: #e0e3eb;
+            color: #131722;
+        }
+
+        html.theme-light .script-editor-resizer {
+            background: #e0e3eb;
+        }
+
+        html.theme-light .script-editor-resizer:hover,
+        html.theme-light body.script-resizing .script-editor-resizer {
+            background: #2962ff;
+        }
+
+        html.theme-light .script-collapse-btn {
+            color: #6a6d78;
+        }
+
+        html.theme-light .script-collapse-btn:hover {
+            background: #e0e3eb;
+            color: #131722;
+        }
+
         /* Empty state */
         .empty-state {
             padding: 24px;
@@ -2099,12 +2163,14 @@
             _onSymbolChanged(nextSymbol) {
                 const normalized = this._normalizeTicker(nextSymbol);
                 if (this._activeSymbol === normalized) return;
+                const root = getIndicatorDataRoot();
                 if (this._activeSymbol) {
-                    Object.keys(window.customIndicatorData || {}).forEach((key) => {
+                    Object.keys(root.customIndicatorData || {}).forEach((key) => {
                         if (key.startsWith(`${this._activeSymbol}_`)) {
-                            delete window.customIndicatorData[key];
+                            delete root.customIndicatorData[key];
                         }
                     });
+                    syncCustomIndicatorDataToIframes();
                 }
                 this._activeSymbol = normalized;
             }
@@ -2176,18 +2242,20 @@
             getBars(symbolInfo, resolution, periodParams, onResult, onError) {
                 const { from, to, countBack } = periodParams;
                 const symbol = this._resolveTicker(symbolInfo);
-                this._onSymbolChanged(symbol);
-                const requestSeq = ++this._barsRequestSeq;
+                const requestSymbol = this._normalizeTicker(symbol);
+                this._onSymbolChanged(requestSymbol);
 
                 let path = `/history?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&from=${from}&to=${to}`;
                 if (countBack) path += `&countback=${countBack}`;
 
                 this._fetchJson(path).then(data => {
-                    if (requestSeq !== this._barsRequestSeq) return;
+                    if (requestSymbol !== this._activeSymbol) return;
                     if (symbol !== this._resolveTicker(symbolInfo)) return;
 
                     if (data.s === 'no_data' || !data.t || !Array.isArray(data.t) || data.t.length === 0) {
-                        return onResult([], { noData: true });
+                        const meta = { noData: true };
+                        if (data.nextTime != null) meta.nextTime = data.nextTime;
+                        return onResult([], meta);
                     }
                     if (data.s === 'error') return onError(data.errmsg || 'history error');
                     if (data.s !== 'ok') return onResult([], { noData: true });
@@ -2216,7 +2284,7 @@
                     mergeBarsIntoStore(key, bars);
                     onResult(bars, { noData: false });
                 }).catch(e => {
-                    if (requestSeq !== this._barsRequestSeq) return;
+                    if (requestSymbol !== this._activeSymbol) return;
                     onError(e.message);
                 });
             }
@@ -2529,25 +2597,102 @@ return {
             return t < 1e12 ? t * 1000 : t;
         }
 
+        function getIndicatorDataRoot() {
+            if (typeof window.parent !== 'undefined'
+                && window.parent
+                && window.parent !== window) {
+                if (!window.parent.customIndicatorData) {
+                    window.parent.customIndicatorData = window.customIndicatorData || {};
+                }
+                return window.parent;
+            }
+            if (!window.customIndicatorData) {
+                window.customIndicatorData = {};
+            }
+            return window;
+        }
+
         function syncCustomIndicatorDataToIframes() {
+            const root = getIndicatorDataRoot();
             document.querySelectorAll('#tv_chart_container iframe').forEach((iframe) => {
                 try {
                     if (iframe.contentWindow) {
-                        iframe.contentWindow.customIndicatorData = window.customIndicatorData;
+                        iframe.contentWindow.customIndicatorData = root.customIndicatorData;
                     }
                 } catch (e) { /* cross-origin guard */ }
             });
         }
 
         function mergeBarsIntoStore(key, bars) {
-            if (!window.customIndicatorData[key]) {
-                window.customIndicatorData[key] = {};
+            const root = getIndicatorDataRoot();
+            if (!root.customIndicatorData) {
+                root.customIndicatorData = {};
             }
-            const bucket = window.customIndicatorData[key];
+            if (!root.customIndicatorData[key]) {
+                root.customIndicatorData[key] = {};
+            }
+            const bucket = root.customIndicatorData[key];
             for (const bar of bars) {
                 bucket[bar.time] = bar;
             }
             syncCustomIndicatorDataToIframes();
+        }
+
+        function upsertSymbolBarToStore(ctx) {
+            const sym = ctx?.symbol;
+            if (!sym || sym.time == null || Number.isNaN(sym.time)) return;
+            const { key } = resolveIndicatorStoreKey(ctx);
+            const t = normalizeBarTime(sym.time);
+            if (t == null) return;
+            mergeBarsIntoStore(key, [{
+                time: t,
+                open: sym.open,
+                high: sym.high,
+                low: sym.low,
+                close: sym.close,
+                volume: sym.volume || 0,
+            }]);
+        }
+
+        function normalizeSymbolFromCtx(sym, info) {
+            let raw = info?.ticker || info?.tickerid || sym?.ticker || sym?.tickerid
+                || info?.name || sym?.name || 'sh600519';
+            raw = String(raw);
+            if (raw.includes(':')) {
+                const parts = raw.split(':');
+                const code = parts[parts.length - 1].replace(/\D/g, '').slice(-6);
+                if (code.length === 6) {
+                    const market = parts[0].toUpperCase().includes('SH') || code.startsWith('6') ? 'sh' : 'sz';
+                    return `${market}${code}`;
+                }
+            }
+            return normalizeSymbolInput(raw).toLowerCase();
+        }
+
+        function resolveBarTime(sym) {
+            if (!sym) return null;
+            if (typeof sym.bartime === 'function') {
+                const bt = sym.bartime();
+                if (bt != null && !Number.isNaN(bt)) return normalizeBarTime(bt);
+            }
+            return normalizeBarTime(sym.time);
+        }
+
+        function resolveBarIndexForContext(ctx, bars) {
+            const sym = ctx?.symbol;
+            if (!sym) return -1;
+
+            if (typeof sym.index === 'number' && sym.index >= 0) {
+                if (!bars.length) return sym.index;
+                return Math.min(sym.index, bars.length - 1);
+            }
+
+            if (!bars.length) return -1;
+
+            const timeIdx = findBarIndex(bars, resolveBarTime(sym));
+            if (timeIdx >= 0) return timeIdx;
+
+            return -1;
         }
 
         function findBarIndex(bars, symbolTime) {
@@ -2583,9 +2728,8 @@ return {
         function resolveIndicatorStoreKey(ctx) {
             const symObj = ctx?.symbol || {};
             const info = symObj.info || symObj;
-            let sym = info.ticker || info.name || info.full_name || symObj.ticker || symObj.name || 'sh600519';
-            sym = normalizeSymbolInput(String(sym)).toLowerCase();
-            const intv = symObj.interval || info.interval || info.resolution || '1D';
+            const sym = normalizeSymbolFromCtx(symObj, info);
+            const intv = symObj.period || symObj.interval || info.interval || info.resolution || info.period || '1D';
 
             const primary = makeBarStoreKey(sym, intv);
             const parentStore = (typeof window.parent !== 'undefined'
@@ -2853,12 +2997,13 @@ return {
                 const symbol = chart.symbol();
                 const resolution = chart.resolution();
                 const key = makeBarStoreKey(symbol, resolution);
-                const store = window.customIndicatorData[key];
-                if (!store) return null;
-                return Object.keys(store)
+                const rootStore = getIndicatorDataRoot().customIndicatorData || {};
+                const bucket = rootStore[key];
+                if (!bucket) return null;
+                return Object.keys(bucket)
                     .map(Number)
                     .sort((a, b) => a - b)
-                    .map(time => store[time]);
+                    .map(time => bucket[time]);
             } catch (e) {
                 return null;
             }
@@ -2957,28 +3102,75 @@ return {
                     styles: Object.fromEntries(def.plots.map(plot => [plot.id, { title: plot.title || plot.id }])),
                 },
                 constructor: function () {
+                    this._pine = null;
                     this.init = function (ctx, inp) {
                         this._context = ctx;
                         this._input = inp;
+                        this._pine = (typeof PineJS !== 'undefined' ? PineJS : null)
+                            || window.PineJS
+                            || (window.parent && window.parent.PineJS)
+                            || null;
+                        const depth = Math.max(
+                            Number(inp.slow) || Number(inp.slowLen) || 26,
+                            Number(inp.fast) || Number(inp.fastLen) || 12,
+                        ) + (Number(inp.signal) || 9) + 50;
+                        if (ctx && typeof ctx.setMinimumAdditionalDepth === 'function') {
+                            ctx.setMinimumAdditionalDepth(depth);
+                        }
                     };
                     this.main = function (ctx, inp) {
+                        upsertSymbolBarToStore(ctx);
                         const { key, store } = getIndicatorBarStore(ctx);
-                        const bars = buildBarsFromStore(store, key);
-                        const idx = findBarIndex(bars, ctx.symbol.time);
+                        let bars = buildBarsFromStore(store, key);
+                        let idx = resolveBarIndexForContext(ctx, bars);
+
+                        const sym = ctx.symbol;
+                        if (idx < 0 && sym && typeof sym.index === 'number' && sym.index >= 0) {
+                            idx = sym.index;
+                        }
+
+                        if (idx < 0) {
+                            return new Array(plotCount).fill(NaN);
+                        }
+
+                        if (bars.length <= idx && sym) {
+                            const t = resolveBarTime(sym);
+                            if (t != null) {
+                                mergeBarsIntoStore(key, [{
+                                    time: t,
+                                    open: sym.open,
+                                    high: sym.high,
+                                    low: sym.low,
+                                    close: sym.close,
+                                    volume: sym.volume || 0,
+                                }]);
+                                bars = buildBarsFromStore(store, key);
+                                idx = resolveBarIndexForContext(ctx, bars);
+                                if (idx < 0 && typeof sym.index === 'number') idx = Math.min(sym.index, bars.length - 1);
+                            }
+                        }
 
                         if (idx < 0 || !bars.length) {
                             return new Array(plotCount).fill(NaN);
                         }
 
                         const history = bars.slice(0, idx + 1);
+                        const bar = bars[idx] || {
+                            time: resolveBarTime(sym),
+                            open: sym?.open,
+                            high: sym?.high,
+                            low: sym?.low,
+                            close: sym?.close,
+                            volume: sym?.volume || 0,
+                        };
 
                         const context = {
-                            time: normalizeBarTime(ctx.symbol.time),
-                            bar: bars[idx],
+                            time: resolveBarTime(sym),
+                            bar,
                             bars: history,
                             barIndex: idx,
-                            isLastBar: idx === bars.length - 1,
-                            PineJS: window.PineJS,
+                            isLastBar: !!(sym?.isLastBar || idx === bars.length - 1),
+                            PineJS: this._pine || window.PineJS,
                             opens: () => history.map(b => b.open),
                             highs: () => history.map(b => b.high),
                             lows: () => history.map(b => b.low),
@@ -2986,7 +3178,7 @@ return {
                             volumes: () => history.map(b => b.volume),
                             input: (name) => inp[name],
                             reportStrategyPnl: () => {
-                                if (idx === bars.length - 1) {
+                                if (sym?.isLastBar || idx === bars.length - 1) {
                                     setTimeout(() => runStrategyBacktestForDefinition(def), 0);
                                 }
                             },
@@ -3289,7 +3481,7 @@ return {
                         monacoEditor = monaco.editor.create(container, {
                             value: initial,
                             language: 'javascript',
-                            theme: 'vs-dark',
+                            theme: isDarkTheme ? 'vs-dark' : 'vs',
                             automaticLayout: true,
                             minimap: { enabled: false },
                             fontSize: 13,
@@ -3416,12 +3608,35 @@ return {
             }
         }
 
+        function syncScriptEditorTheme() {
+            if (typeof monaco !== 'undefined' && monacoEditor) {
+                monaco.editor.setTheme(isDarkTheme ? 'vs-dark' : 'vs');
+            }
+        }
+
         function initThemePreference() {
             const saved = localStorage.getItem(UI_THEME_KEY);
-            isDarkTheme = saved !== 'light';
+            if (saved === 'light' || saved === 'dark') {
+                isDarkTheme = saved === 'dark';
+            } else {
+                isDarkTheme = window.matchMedia('(prefers-color-scheme: dark)').matches;
+            }
             document.documentElement.classList.toggle('theme-dark', isDarkTheme);
             document.documentElement.classList.toggle('theme-light', !isDarkTheme);
             document.documentElement.dataset.theme = isDarkTheme ? 'dark' : 'light';
+            syncScriptEditorTheme();
+
+            if (!localStorage.getItem(UI_THEME_KEY)) {
+                window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+                    if (localStorage.getItem(UI_THEME_KEY)) return;
+                    isDarkTheme = e.matches;
+                    document.documentElement.classList.toggle('theme-dark', isDarkTheme);
+                    document.documentElement.classList.toggle('theme-light', !isDarkTheme);
+                    document.documentElement.dataset.theme = isDarkTheme ? 'dark' : 'light';
+                    tvWidgets.forEach(widget => syncChartTheme(widget));
+                    syncScriptEditorTheme();
+                });
+            }
         }
 
         function syncChartTheme(widget) {
@@ -3440,6 +3655,7 @@ return {
             document.documentElement.classList.toggle('theme-light', !isDarkTheme);
             document.documentElement.dataset.theme = isDarkTheme ? 'dark' : 'light';
             tvWidgets.forEach(widget => syncChartTheme(widget));
+            syncScriptEditorTheme();
         }
 
         // ============ Modal Dialog ============

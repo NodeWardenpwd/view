@@ -24,7 +24,7 @@ const SUPPORTED_RESOLUTIONS: &[&str] = &["1", "5", "15", "30", "60", "D", "W", "
 const TENCENT_FQKLINE_URL: &str = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get";
 const TENCENT_MKLINE_URL: &str = "https://ifzq.gtimg.cn/appstock/app/kline/mkline";
 const TENCENT_KLINE_LIMIT: u32 = 640;
-const TENCENT_FQKLINE_MAX_PAGES: u32 = 24;
+const TENCENT_FQKLINE_MAX_PAGES: u32 = 48;
 const TENCENT_QT_URL: &str = "https://qt.gtimg.cn/q=";
 const TENCENT_SEARCH_URL: &str = "https://proxy.finance.qq.com/ifzqgtimg/appstock/code/search";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -1004,6 +1004,9 @@ async fn fetch_history_bars_paginated(
 
     let target_from_date = if from >= 0 {
         parse_bar_naive_date(&unix_to_shanghai_date(from))
+    } else if to >= 0 {
+        // TV firstDataRequest may send invalid `from`; walk back from `to`.
+        parse_bar_naive_date(&unix_to_shanghai_date(to.saturating_sub(86400 * 1200)))
     } else {
         None
     };
@@ -1038,10 +1041,10 @@ async fn fetch_history_bars_paginated(
             }
         };
 
-        let oldest = bar_oldest_date(&batch);
+        let batch_oldest = bar_oldest_date(&batch);
         merge_bars(&mut all_bars, batch);
 
-        let Some(oldest) = oldest else { break };
+        let Some(oldest) = batch_oldest else { break };
 
         if prev_oldest == Some(oldest) {
             warn!("Tencent fqkline pagination stalled at {oldest} for {symbol}");
@@ -1055,13 +1058,10 @@ async fn fetch_history_bars_paginated(
             }
         }
 
-        end_date = oldest.pred_opt().map(|d| d.format("%Y-%m-%d").to_string());
-        if end_date.is_none() {
-            break;
-        }
+        end_date = Some(oldest.format("%Y-%m-%d").to_string());
 
         if page + 1 < TENCENT_FQKLINE_MAX_PAGES {
-            sleep(Duration::from_millis(120)).await;
+            sleep(Duration::from_millis(200)).await;
         }
     }
 
@@ -1226,16 +1226,45 @@ fn select_bars_for_history(
     let min_ts = parsed.first().map(|(ts, _)| *ts)?;
     let max_ts = parsed.last().map(|(ts, _)| *ts)?;
 
-    if from < 0 || to < 0 || to < from {
-        return None;
-    }
-
-    // No overlap: TV is asking for a window we have not fetched yet (scroll-left gap).
-    if to < min_ts || from > max_ts {
-        return None;
-    }
-
     let cb = countback.map(|c| c.max(1) as usize).unwrap_or(300);
+
+    // Invalid or firstDataRequest-style window: return countback bars ending at `to`.
+    if to < 0 {
+        return None;
+    }
+    if from < 0 || to < from {
+        let mut candidates: Vec<(i64, &StockBar)> = parsed
+            .iter()
+            .copied()
+            .filter(|(ts, _)| *ts <= to)
+            .collect();
+        if candidates.len() > cb {
+            candidates = candidates.split_off(candidates.len() - cb);
+        }
+        return if candidates.is_empty() { None } else { Some(candidates) };
+    }
+
+    // TV scroll-left gap: request entirely before fetched range — signal retry.
+    if to < min_ts {
+        return None;
+    }
+
+    // Request starts before fetched range but overlaps on the right — return what we have.
+    if from < min_ts {
+        let mut candidates: Vec<(i64, &StockBar)> = parsed
+            .iter()
+            .copied()
+            .filter(|(ts, _)| *ts <= to)
+            .collect();
+        if candidates.len() > cb {
+            candidates = candidates.split_off(candidates.len() - cb);
+        }
+        return if candidates.is_empty() { None } else { Some(candidates) };
+    }
+
+    if from > max_ts {
+        return None;
+    }
 
     let mut candidates: Vec<(i64, &StockBar)> = parsed
         .iter()
