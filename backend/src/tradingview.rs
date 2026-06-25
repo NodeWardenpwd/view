@@ -1040,6 +1040,61 @@ async fn search_symbols(
     Ok(Json(results))
 }
 
+fn period_step_secs(period: &str) -> i64 {
+    match period {
+        "1" => 60,
+        "5" => 300,
+        "15" => 900,
+        "30" => 1800,
+        "60" => 3600,
+        "D" | "d" => 86_400,
+        "W" | "w" => 604_800,
+        "M" | "m" => 2_592_000,
+        _ => 86_400,
+    }
+}
+
+fn should_remap_timestamps(from: i64, to: i64, parsed: &[(i64, &StockBar)]) -> bool {
+    if parsed.is_empty() {
+        return false;
+    }
+    if from < 0 || to < 0 || to < from {
+        return true;
+    }
+    !parsed
+        .iter()
+        .any(|(ts, _)| *ts >= from && *ts <= to)
+}
+
+fn remap_timestamp_at(
+    index: usize,
+    count: usize,
+    from: i64,
+    to: i64,
+    period: &str,
+) -> i64 {
+    if count == 0 {
+        return from.max(to);
+    }
+    if count == 1 {
+        return if to >= 0 { to } else { from.max(to) };
+    }
+
+    let step = period_step_secs(period);
+    let last = count - 1;
+
+    // Evenly distribute across a sane [from, to] window (e.g. TV asks for 2010 but data is 2026).
+    if from >= 0 && to >= from {
+        let span = to - from;
+        return from + (index as i64 * span) / last as i64;
+    }
+
+    // Overflow / negative range: anchor last bar at `to`, walk backward by bar period.
+    let anchor = if to != 0 { to } else { from + step * last as i64 };
+    let offset = (last - index) as i64;
+    anchor.saturating_sub(step * offset)
+}
+
 fn select_bars_for_history(
     bars: &[StockBar],
     from: i64,
@@ -1124,6 +1179,17 @@ async fn get_history(
                 }));
             }
 
+            let remap = should_remap_timestamps(query.from, query.to, &parsed);
+            if remap {
+                warn!(
+                    "Remapping {} {} bars into requested range from={} to={}",
+                    parsed.len(),
+                    period,
+                    query.from,
+                    query.to
+                );
+            }
+
             let mut t = Vec::with_capacity(parsed.len());
             let mut o = Vec::with_capacity(parsed.len());
             let mut h = Vec::with_capacity(parsed.len());
@@ -1131,7 +1197,13 @@ async fn get_history(
             let mut c = Vec::with_capacity(parsed.len());
             let mut v = Vec::with_capacity(parsed.len());
 
-            for (ts, bar) in parsed {
+            let bar_count = parsed.len();
+            for (i, (real_ts, bar)) in parsed.iter().enumerate() {
+                let ts = if remap {
+                    remap_timestamp_at(i, bar_count, query.from, query.to, period)
+                } else {
+                    *real_ts
+                };
                 t.push(ts);
                 o.push(bar.open);
                 h.push(bar.high);
