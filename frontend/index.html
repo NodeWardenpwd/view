@@ -2201,21 +2201,19 @@
 
                     const bars = [];
                     const key = makeBarStoreKey(symbol, resolution);
-                    window.customIndicatorData[key] = {};
 
                     for (let i = 0; i < len; i++) {
                         const time = data.t[i] * 1000;
-                        const bar = {
+                        bars.push({
                             time,
                             open: data.o[i],
                             high: data.h[i],
                             low: data.l[i],
                             close: data.c[i],
                             volume: data.v[i],
-                        };
-                        bars.push(bar);
-                        window.customIndicatorData[key][time] = bar;
+                        });
                     }
+                    mergeBarsIntoStore(key, bars);
                     onResult(bars, { noData: false });
                 }).catch(e => {
                     if (requestSeq !== this._barsRequestSeq) return;
@@ -2241,8 +2239,7 @@
                         volume: data.v[i]
                     };
                     const key = makeBarStoreKey(symbol, resolution);
-                    if (!window.customIndicatorData[key]) window.customIndicatorData[key] = {};
-                    window.customIndicatorData[key][bar.time] = bar;
+                    mergeBarsIntoStore(key, [bar]);
                     onTick(bar);
                 }).catch(() => {});
             }
@@ -2532,13 +2529,91 @@ return {
             return t < 1e12 ? t * 1000 : t;
         }
 
+        function syncCustomIndicatorDataToIframes() {
+            document.querySelectorAll('#tv_chart_container iframe').forEach((iframe) => {
+                try {
+                    if (iframe.contentWindow) {
+                        iframe.contentWindow.customIndicatorData = window.customIndicatorData;
+                    }
+                } catch (e) { /* cross-origin guard */ }
+            });
+        }
+
+        function mergeBarsIntoStore(key, bars) {
+            if (!window.customIndicatorData[key]) {
+                window.customIndicatorData[key] = {};
+            }
+            const bucket = window.customIndicatorData[key];
+            for (const bar of bars) {
+                bucket[bar.time] = bar;
+            }
+            syncCustomIndicatorDataToIframes();
+        }
+
         function findBarIndex(bars, symbolTime) {
+            if (!bars.length || symbolTime == null || Number.isNaN(symbolTime)) return -1;
+
             const ms = normalizeBarTime(symbolTime);
             if (ms == null) return -1;
-            let idx = bars.findIndex(b => b.time === ms);
-            if (idx >= 0) return idx;
-            idx = bars.findIndex(b => b.time === symbolTime);
-            return idx;
+
+            for (let i = 0; i < bars.length; i++) {
+                if (bars[i].time === ms || bars[i].time === symbolTime) return i;
+            }
+
+            const targetDay = Math.floor(ms / 86400000);
+            for (let i = bars.length - 1; i >= 0; i--) {
+                if (Math.floor(bars[i].time / 86400000) === targetDay) return i;
+            }
+
+            let lo = 0;
+            let hi = bars.length - 1;
+            let result = -1;
+            while (lo <= hi) {
+                const mid = (lo + hi) >> 1;
+                if (bars[mid].time <= ms) {
+                    result = mid;
+                    lo = mid + 1;
+                } else {
+                    hi = mid - 1;
+                }
+            }
+            return result;
+        }
+
+        function resolveIndicatorStoreKey(ctx) {
+            const symObj = ctx?.symbol || {};
+            const info = symObj.info || symObj;
+            let sym = info.ticker || info.name || info.full_name || symObj.ticker || symObj.name || 'sh600519';
+            sym = normalizeSymbolInput(String(sym)).toLowerCase();
+            const intv = symObj.interval || info.interval || info.resolution || '1D';
+
+            const primary = makeBarStoreKey(sym, intv);
+            const parentStore = (typeof window.parent !== 'undefined'
+                && window.parent
+                && window.parent !== window
+                && window.parent.customIndicatorData)
+                ? window.parent.customIndicatorData
+                : null;
+            const localStore = window.customIndicatorData || {};
+            const store = parentStore || localStore;
+
+            const candidates = [
+                primary,
+                `${sym}_${intv}`,
+                `${sym}_${normalizeIntervalKey(intv)}`,
+                makeBarStoreKey(sym, 'D'),
+                makeBarStoreKey(sym, '1D'),
+            ];
+
+            for (const key of candidates) {
+                if (store[key] && Object.keys(store[key]).length > 0) return { key, store };
+            }
+            return { key: primary, store };
+        }
+
+        function getIndicatorBarStore(ctx) {
+            const { key, store } = resolveIndicatorStoreKey(ctx);
+            return { key, store, bars: store[key] || {} };
         }
 
         function extractStudyDescriptionFromCode(code) {
@@ -2718,15 +2793,6 @@ return {
             return `${sym}_${normalizeIntervalKey(resolution)}`;
         }
 
-        function getIndicatorBarStore(ctx) {
-            const info = ctx.symbol.info;
-            const sym = info ? (info.ticker || info.name) : 'sh600519';
-            const intv = ctx.symbol.interval || '1D';
-            const key = makeBarStoreKey(sym, intv);
-            const store = (window.parent && window.parent.customIndicatorData) || window.customIndicatorData || {};
-            return { key, store, bars: store[key] || {} };
-        }
-
         function buildBarsFromStore(store, key) {
             let raw = store[key] || {};
             if (Object.keys(raw).length === 0) {
@@ -2899,13 +2965,19 @@ return {
                         const { key, store } = getIndicatorBarStore(ctx);
                         const bars = buildBarsFromStore(store, key);
                         const idx = findBarIndex(bars, ctx.symbol.time);
-                        const history = idx >= 0 ? bars.slice(0, idx + 1) : bars;
+
+                        if (idx < 0 || !bars.length) {
+                            return new Array(plotCount).fill(NaN);
+                        }
+
+                        const history = bars.slice(0, idx + 1);
 
                         const context = {
                             time: normalizeBarTime(ctx.symbol.time),
-                            bar: idx >= 0 ? bars[idx] : null,
+                            bar: bars[idx],
                             bars: history,
-                            isLastBar: idx >= 0 && idx === bars.length - 1,
+                            barIndex: idx,
+                            isLastBar: idx === bars.length - 1,
                             PineJS: window.PineJS,
                             opens: () => history.map(b => b.open),
                             highs: () => history.map(b => b.high),
@@ -2914,7 +2986,7 @@ return {
                             volumes: () => history.map(b => b.volume),
                             input: (name) => inp[name],
                             reportStrategyPnl: () => {
-                                if (idx >= 0 && idx === bars.length - 1) {
+                                if (idx === bars.length - 1) {
                                     setTimeout(() => runStrategyBacktestForDefinition(def), 0);
                                 }
                             },
@@ -3954,10 +4026,14 @@ return {
                 syncChartTheme(widget);
                 setTimeout(() => syncChartTheme(widget), 300);
                 setTimeout(() => syncChartTheme(widget), 1200);
+                syncCustomIndicatorDataToIframes();
 
                 if (pendingApplyStudy || getAppliedStudyDescription()) {
                     pendingApplyStudy = false;
-                    setTimeout(() => applyStudyFromEditor(widget), 500);
+                    setTimeout(() => {
+                        syncCustomIndicatorDataToIframes();
+                        applyStudyFromEditor(widget);
+                    }, 500);
                 }
 
                 setTimeout(() => {
