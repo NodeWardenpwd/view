@@ -24,7 +24,7 @@ const SUPPORTED_RESOLUTIONS: &[&str] = &["1", "5", "15", "30", "60", "D", "W", "
 const TENCENT_FQKLINE_URL: &str = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get";
 const TENCENT_MKLINE_URL: &str = "https://ifzq.gtimg.cn/appstock/app/kline/mkline";
 const TENCENT_KLINE_LIMIT: u32 = 640;
-const TENCENT_FQKLINE_MAX_PAGES: u32 = 12;
+const TENCENT_FQKLINE_MAX_PAGES: u32 = 24;
 const TENCENT_QT_URL: &str = "https://qt.gtimg.cn/q=";
 const TENCENT_SEARCH_URL: &str = "https://proxy.finance.qq.com/ifzqgtimg/appstock/code/search";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -508,15 +508,17 @@ fn fqkline_unit(period: &str) -> Option<&'static str> {
     }
 }
 
-fn tencent_fqkline_url(symbol: &str, unit: &str, end_date: Option<&str>) -> String {
-    match end_date.filter(|s| !s.is_empty()) {
-        Some(end) => format!(
-            "{TENCENT_FQKLINE_URL}?param={symbol},{unit},,{end},{TENCENT_KLINE_LIMIT},qfq"
-        ),
-        None => format!(
-            "{TENCENT_FQKLINE_URL}?param={symbol},{unit},,,{TENCENT_KLINE_LIMIT},qfq"
-        ),
-    }
+fn tencent_fqkline_url(
+    symbol: &str,
+    unit: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+) -> String {
+    let start = start.unwrap_or("");
+    let end = end.unwrap_or("");
+    format!(
+        "{TENCENT_FQKLINE_URL}?param={symbol},{unit},{start},{end},{TENCENT_KLINE_LIMIT},qfq"
+    )
 }
 
 fn merge_bars(into: &mut Vec<StockBar>, batch: Vec<StockBar>) {
@@ -920,9 +922,10 @@ async fn fetch_tencent_fqkline_page(
     symbol: &str,
     unit: &str,
     data_key: &str,
-    end_date: Option<&str>,
+    start: Option<&str>,
+    end: Option<&str>,
 ) -> Result<Vec<StockBar>, String> {
-    let url = tencent_fqkline_url(symbol, unit, end_date);
+    let url = tencent_fqkline_url(symbol, unit, start, end);
     debug!("Tencent fqkline request: {}", url);
 
     let resp = http_get_with_retry(&state.http, &url, "Tencent fqkline").await?;
@@ -975,8 +978,7 @@ async fn fetch_history_bars(
     Ok(bars)
 }
 
-/// Paginate fqkline with Tencent's `param=code,day,,,640,qfq` / `,,end,640,qfq` pattern.
-/// Always walks back up to TENCENT_FQKLINE_MAX_PAGES (≈12×640 bars) so scroll-left has depth.
+/// Paginate fqkline backward until TV's `from` is covered or pages exhausted.
 async fn fetch_history_bars_paginated(
     state: &TradingViewState,
     code: &str,
@@ -987,8 +989,6 @@ async fn fetch_history_bars_paginated(
     if !matches!(period, "D" | "W" | "M") {
         return fetch_history_bars(state, code, period).await;
     }
-
-    let _ = from;
 
     let clean_code = clean_code_digits(code);
     if clean_code.len() != 6 {
@@ -1005,14 +1005,32 @@ async fn fetch_history_bars_paginated(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    // When TV scrolls left, anchor the first page at its `to` date.
-    let mut end_date: Option<String> = if to >= 0 && to < now {
+    let start_date = if from >= 0 {
+        unix_to_shanghai_date(from)
+    } else {
+        String::new()
+    };
+
+    let target_from_date = if from >= 0 {
+        parse_bar_naive_date(&start_date)
+    } else {
+        None
+    };
+
+    let mut end_date: Option<String> = if to >= 0 && to <= now {
         Some(unix_to_shanghai_date(to))
     } else {
         None
     };
 
+    let start_ref = if start_date.is_empty() {
+        None
+    } else {
+        Some(start_date.as_str())
+    };
+
     let mut all_bars: Vec<StockBar> = Vec::new();
+    let mut prev_oldest: Option<NaiveDate> = None;
 
     for page in 0..TENCENT_FQKLINE_MAX_PAGES {
         let batch = match fetch_tencent_fqkline_page(
@@ -1020,6 +1038,7 @@ async fn fetch_history_bars_paginated(
             &symbol,
             unit,
             &data_key,
+            start_ref,
             end_date.as_deref(),
         )
         .await
@@ -1035,17 +1054,29 @@ async fn fetch_history_bars_paginated(
         };
 
         let oldest = bar_oldest_date(&batch);
-        let before = all_bars.len();
         merge_bars(&mut all_bars, batch);
-        if all_bars.len() == before {
-            break;
-        }
 
         let Some(oldest) = oldest else { break };
+
+        if prev_oldest == Some(oldest) {
+            warn!("Tencent fqkline pagination stalled at {oldest} for {symbol}");
+            break;
+        }
+        prev_oldest = Some(oldest);
+
+        if let Some(target) = target_from_date {
+            if oldest <= target {
+                break;
+            }
+        }
 
         end_date = oldest.pred_opt().map(|d| d.format("%Y-%m-%d").to_string());
         if end_date.is_none() {
             break;
+        }
+
+        if page + 1 < TENCENT_FQKLINE_MAX_PAGES {
+            sleep(Duration::from_millis(120)).await;
         }
     }
 
@@ -1214,22 +1245,20 @@ fn select_bars_for_history(
         return None;
     }
 
-    // No overlap between TV request and our fetched data.
+    // No overlap: TV is asking for a window we have not fetched yet (scroll-left gap).
     if to < min_ts || from > max_ts {
         return None;
     }
 
-    let cb = countback.map(|c| c.max(1) as usize).unwrap_or(300);
+    let cb = countback.map(|c| c.max(1) as usize).unwrap_or(640);
 
-    // Bars at or before `to`, prefer those at or after `from`.
     let mut candidates: Vec<(i64, &StockBar)> = parsed
         .iter()
         .copied()
         .filter(|(ts, _)| *ts <= to && *ts >= from)
         .collect();
 
-    // UDF countback: extend backward when the [from,to] window is too narrow.
-    if candidates.len() < cb {
+    if candidates.is_empty() {
         candidates = parsed
             .iter()
             .copied()
