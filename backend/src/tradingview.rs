@@ -489,9 +489,43 @@ fn unix_to_shanghai_date(secs: i64) -> String {
 fn tencent_fqkline_date_range(from: i64, to: i64) -> (String, String) {
     if from >= 0 && to >= from {
         (unix_to_shanghai_date(from), unix_to_shanghai_date(to))
+    } else if to >= 0 {
+        // TV sometimes sends invalid `from`; anchor a wide window ending at `to`.
+        let approx_from = to.saturating_sub(86400 * 900);
+        (unix_to_shanghai_date(approx_from), unix_to_shanghai_date(to))
     } else {
         (String::new(), String::new())
     }
+}
+
+fn period_step_secs(period: &str) -> i64 {
+    match period {
+        "1" => 60,
+        "5" => 300,
+        "15" => 900,
+        "30" => 1800,
+        "60" => 3600,
+        "D" | "d" => 86_400,
+        "W" | "w" => 604_800,
+        "M" | "m" => 2_592_000,
+        _ => 86_400,
+    }
+}
+
+fn bar_list_min_ts(bars: &[StockBar]) -> Option<i64> {
+    bars
+        .iter()
+        .filter_map(|b| parse_bar_timestamp(&b.date))
+        .min()
+}
+
+fn merge_bars(into: &mut Vec<StockBar>, batch: Vec<StockBar>) {
+    for bar in batch {
+        if !into.iter().any(|b| b.date == bar.date) {
+            into.push(bar);
+        }
+    }
+    into.sort_by(|a, b| a.date.cmp(&b.date));
 }
 
 fn normalize_resolution(resolution: &str) -> Option<&'static str> {
@@ -936,6 +970,65 @@ async fn fetch_history_bars(
     Ok(bars)
 }
 
+/// Tencent fqkline returns at most 640 bars per request (most recent within the date window).
+/// Paginate backward until the requested `from` is covered or no more data.
+async fn fetch_history_bars_paginated(
+    state: &TradingViewState,
+    code: &str,
+    period: &str,
+    from: i64,
+    to: i64,
+) -> Result<Vec<StockBar>, String> {
+    if !matches!(period, "D" | "W" | "M") {
+        return fetch_history_bars(state, code, period, from, to).await;
+    }
+
+    let target_from = from.max(0);
+    let fetch_end = if to >= 0 {
+        to
+    } else {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64
+    };
+
+    let step = period_step_secs(period);
+    let mut all_bars: Vec<StockBar> = Vec::new();
+    let mut fetch_to = fetch_end;
+
+    for page in 0..8 {
+        let batch = fetch_history_bars(state, code, period, target_from, fetch_to).await?;
+        if batch.is_empty() {
+            break;
+        }
+
+        let batch_min = bar_list_min_ts(&batch);
+        let before = all_bars.len();
+        merge_bars(&mut all_bars, batch);
+        if all_bars.len() == before {
+            break;
+        }
+
+        let Some(min_ts) = batch_min else { break };
+
+        if min_ts <= target_from || page == 7 {
+            break;
+        }
+
+        fetch_to = min_ts.saturating_sub(step);
+        if fetch_to <= target_from {
+            break;
+        }
+    }
+
+    if all_bars.is_empty() {
+        return Err(format!("Tencent returned empty klines for {code} ({period})"));
+    }
+
+    Ok(all_bars)
+}
+
 async fn fetch_quotes(
     state: &TradingViewState,
     tv_symbols: &[String],
@@ -1093,14 +1186,17 @@ fn select_bars_for_history(
         return None;
     }
 
-    // Request window has no overlap with available klines (e.g. 2010 vs our 2023–2026 cache).
+    // Request window has no overlap with available klines.
     if to < min_ts || from > max_ts {
         return None;
     }
 
+    let eff_from = from.max(min_ts);
+    let eff_to = to.min(max_ts);
+
     let mut filtered: Vec<(i64, &StockBar)> = parsed
         .into_iter()
-        .filter(|(ts, _)| *ts >= from && *ts <= to)
+        .filter(|(ts, _)| *ts >= eff_from && *ts <= eff_to)
         .collect();
 
     if filtered.is_empty() {
@@ -1144,7 +1240,7 @@ async fn get_history(
         }));
     }
 
-    match fetch_history_bars(&state, &code, period, query.from, query.to).await {
+    match fetch_history_bars_paginated(&state, &code, period, query.from, query.to).await {
         Ok(bars) => {
             if bars.is_empty() {
                 return Ok(Json(UdfHistoryResponse::NoData {

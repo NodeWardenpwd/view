@@ -1381,6 +1381,40 @@
             quotePollTimer = setInterval(pollWatchlistQuotes, 10000);
         }
 
+        function normalizeSymbolInput(raw) {
+            const value = raw.trim().toLowerCase();
+            const digits = value.replace(/\D/g, '');
+            const code = digits.length >= 6 ? digits.slice(-6) : digits;
+            if (code.length !== 6) return raw.trim().toUpperCase();
+            if (value.startsWith('sh') || value.startsWith('sz')) {
+                return `${value.slice(0, 2)}${code}`;
+            }
+            return code.startsWith('6') ? `sh${code}` : `sz${code}`;
+        }
+
+        const CHART_ACTIVE_SYMBOL_KEY = 'chart_active_symbol';
+
+        function isValidAshareSymbol(symbol) {
+            return /^(sh|sz)\d{6}$/.test(normalizeSymbolInput(symbol).toLowerCase());
+        }
+
+        function getChartActiveSymbol() {
+            const saved = localStorage.getItem(CHART_ACTIVE_SYMBOL_KEY)
+                || localStorage.getItem('watchlist_selected');
+            if (saved && isValidAshareSymbol(saved)) {
+                return normalizeSymbolInput(saved).toLowerCase();
+            }
+            return 'sh600519';
+        }
+
+        function saveChartActiveSymbol(symbol) {
+            const normalized = normalizeSymbolInput(symbol);
+            if (!isValidAshareSymbol(normalized)) return;
+            const ticker = normalized.toLowerCase();
+            localStorage.setItem(CHART_ACTIVE_SYMBOL_KEY, ticker);
+            localStorage.setItem('watchlist_selected', ticker);
+        }
+
         class WatchlistManager {
             constructor() {
                 this.STORAGE_KEY = 'watchlist_data';
@@ -1391,7 +1425,7 @@
 
                 this.lists = this.loadFromStorage();
                 this.currentListName = localStorage.getItem('watchlist_current') || '自选股';
-                this.selectedSymbol = localStorage.getItem('watchlist_selected') || 'sh600519';
+                this.selectedSymbol = getChartActiveSymbol();
                 this.isDropdownOpen = false;
                 this.draggedItem = null;
             }
@@ -1414,11 +1448,11 @@
                         this.lists['自选股'] = symbols;
                         this.saveToStorage();
                     }
-                    // Ensure selectedSymbol is valid
                     const allSymbols = symbols.map(s => s.symbol);
-                    if (!allSymbols.includes(this.selectedSymbol) && allSymbols.length > 0) {
-                        this.selectedSymbol = allSymbols[0];
-                        this.saveToStorage();
+                    // Only reset if persisted symbol is malformed
+                    if (!isValidAshareSymbol(this.selectedSymbol) && allSymbols.length > 0) {
+                        this.selectedSymbol = allSymbols[0].symbol;
+                        saveChartActiveSymbol(this.selectedSymbol);
                     }
                 }
                 this.render();
@@ -1506,8 +1540,9 @@
             }
 
             selectSymbol(symbol) {
-                const normalized = normalizeSymbolInput(symbol);
+                const normalized = normalizeSymbolInput(symbol).toLowerCase();
                 this.selectedSymbol = normalized;
+                saveChartActiveSymbol(normalized);
                 this.saveToStorage();
                 this.render();
                 if (tvWidgets[selectedChartIndex]) {
@@ -1702,17 +1737,6 @@
 
         // Initialize watchlist manager
         const watchlistManager = new WatchlistManager();
-
-        function normalizeSymbolInput(raw) {
-            const value = raw.trim().toLowerCase();
-            const digits = value.replace(/\D/g, '');
-            const code = digits.length >= 6 ? digits.slice(-6) : digits;
-            if (code.length !== 6) return raw.trim().toUpperCase();
-            if (value.startsWith('sh') || value.startsWith('sz')) {
-                return `${value.slice(0, 2)}${code}`;
-            }
-            return code.startsWith('6') ? `sh${code}` : `sz${code}`;
-        }
 
         // ============ Custom Datafeed ============
         class CustomDatafeed {
@@ -2530,8 +2554,8 @@
         }
 
         function createWidget(index, customSymbol = null) {
-            // Use custom symbol if provided, otherwise use watchlist selected symbol
-            const symbol = customSymbol || (watchlistManager ? watchlistManager.selectedSymbol : 'sh600519');
+            const symbol = (customSymbol || getChartActiveSymbol()).toLowerCase();
+            saveChartActiveSymbol(symbol);
 
             const widget = new TradingView.widget({
                 symbol: symbol,
@@ -2546,7 +2570,7 @@
                 autosize: true,
                 theme: isDarkTheme ? "Dark" : "Light",
                 save_load_adapter: createSaveLoadAdapter(),
-                load_last_chart: true,
+                load_last_chart: false,
                 auto_save_delay: 5,
                 custom_indicators_getter: (PineJS) => {
                     return Promise.resolve(getCustomIndicators(PineJS));
@@ -2633,6 +2657,26 @@
                     }
                 } catch (e) {
                     console.error('Failed to inject indicator data:', e);
+                }
+
+                try {
+                    const chart = widget.activeChart();
+                    chart.onSymbolChanged().subscribe(null, () => {
+                        chart.symbolExt((info) => {
+                            const ticker = info.ticker || info.pro_name || info.name;
+                            if (ticker && isValidAshareSymbol(ticker)) {
+                                const normalized = normalizeSymbolInput(ticker).toLowerCase();
+                                saveChartActiveSymbol(normalized);
+                                if (watchlistManager) {
+                                    watchlistManager.selectedSymbol = normalized;
+                                    watchlistManager.saveToStorage();
+                                    watchlistManager.render();
+                                }
+                            }
+                        });
+                    });
+                } catch (e) {
+                    console.warn('Symbol change listener unavailable:', e);
                 }
 
                 widget._ready = true;
@@ -2830,8 +2874,11 @@
                 }, 0);
             });
 
-            // Initialize with single chart
-            createWidget(0);
+            // Initialize with persisted active symbol
+            if (watchlistManager) {
+                watchlistManager.selectedSymbol = getChartActiveSymbol();
+            }
+            createWidget(0, getChartActiveSymbol());
             selectChart(0);
 
         }
