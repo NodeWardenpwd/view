@@ -1347,7 +1347,7 @@
             if (!watchlistManager) return;
             const symbols = new Set();
             Object.values(watchlistManager.lists).forEach(list => {
-                list.forEach(item => symbols.add(item.symbol));
+                list.forEach(item => symbols.add(normalizeSymbolInput(item.symbol).toLowerCase()));
             });
             if (symbols.size === 0) return;
 
@@ -1359,9 +1359,10 @@
                 if (!res.ok) return;
                 const quotes = await res.json();
                 Object.entries(quotes).forEach(([symbol, quote]) => {
+                    const key = normalizeSymbolInput(symbol).toLowerCase();
                     const lists = Object.values(watchlistManager.lists);
                     lists.forEach(list => {
-                        const item = list.find(i => i.symbol.toUpperCase() === symbol.toUpperCase());
+                        const item = list.find(i => normalizeSymbolInput(i.symbol).toLowerCase() === key);
                         if (!item) return;
                         item.last = quote.last;
                         item.change = quote.change;
@@ -1378,7 +1379,7 @@
         function startQuotePolling() {
             if (quotePollTimer) clearInterval(quotePollTimer);
             pollWatchlistQuotes();
-            quotePollTimer = setInterval(pollWatchlistQuotes, 10000);
+            quotePollTimer = setInterval(pollWatchlistQuotes, 5000);
         }
 
         function normalizeSymbolInput(raw) {
@@ -1747,6 +1748,7 @@
                 this._resolveSeq = 0;
                 this._barsRequestSeq = 0;
                 this._activeSymbol = null;
+                this._quotePollTimers = {};
             }
 
             _normalizeTicker(raw) {
@@ -1813,10 +1815,12 @@
                         supported_resolutions: cfg.supported_resolutions || ['1', '5', '15', '30', '60', 'D', 'W', 'M'],
                         supports_marks: false,
                         supports_timescale_marks: false,
-                        supports_time: true
+                        supports_time: true,
+                        supports_quotes: true,
                     }), 0);
                 }).catch(() => setTimeout(() => cb({
-                    supported_resolutions: ['1', '5', '15', '30', '60', 'D', 'W', 'M']
+                    supported_resolutions: ['1', '5', '15', '30', '60', 'D', 'W', 'M'],
+                    supports_quotes: true,
                 }), 0));
             }
 
@@ -1937,7 +1941,7 @@
                 this._onSymbolChanged(symbol);
                 this.subscriptions[listenerGuid] = { symbol, resolution, onTick, seq: this._barsRequestSeq };
 
-                const pollMs = ['D', '1D', 'W', '1W', 'M', '1M'].includes(resolution) ? 30000 : 10000;
+                const pollMs = ['D', '1D', 'W', '1W', 'M', '1M'].includes(resolution) ? 5000 : 3000;
                 const pollSeq = this._barsRequestSeq;
                 this._pollLatestBar(symbol, resolution, onTick, pollSeq);
                 this._pollTimers[listenerGuid] = setInterval(
@@ -1963,6 +1967,50 @@
                     .then(r => r.text())
                     .then(t => cb(parseInt(t, 10)))
                     .catch(() => cb(Math.floor(Date.now() / 1000)));
+            }
+
+            getQuotes(symbols, onDataCallback, onErrorCallback) {
+                const normalized = symbols.map(s => this._normalizeTicker(s));
+                const path = `/quotes?symbols=${encodeURIComponent(normalized.join(','))}`;
+                this._fetchJson(path).then(data => {
+                    onDataCallback(symbols.map((sym, idx) => {
+                        const ticker = normalized[idx];
+                        const q = data[ticker];
+                        if (!q) {
+                            return { s: 'error', n: sym };
+                        }
+                        return {
+                            s: 'ok',
+                            n: sym,
+                            v: {
+                                ch: q.change,
+                                chp: q.change_percent,
+                                short_name: q.name || ticker,
+                                exchange: ticker.startsWith('sh') ? 'SSE' : 'SZSE',
+                                description: q.name || ticker,
+                                lp: q.last,
+                                open_price: q.open,
+                                high_price: q.last,
+                                low_price: q.last,
+                                prev_close_price: q.open,
+                                volume: 0,
+                            },
+                        };
+                    }));
+                }).catch(err => onErrorCallback(err.message || 'quotes failed'));
+            }
+
+            subscribeQuotes(symbols, _fastSymbols, onRealtimeCallback, listenerGUID) {
+                const poll = () => this.getQuotes(symbols, onRealtimeCallback, () => {});
+                poll();
+                this._quotePollTimers[listenerGUID] = setInterval(poll, 5000);
+            }
+
+            unsubscribeQuotes(listenerGUID) {
+                if (this._quotePollTimers[listenerGUID]) {
+                    clearInterval(this._quotePollTimers[listenerGUID]);
+                    delete this._quotePollTimers[listenerGUID];
+                }
             }
         }
 

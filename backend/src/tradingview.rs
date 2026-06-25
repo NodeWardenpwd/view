@@ -24,6 +24,7 @@ const SUPPORTED_RESOLUTIONS: &[&str] = &["1", "5", "15", "30", "60", "D", "W", "
 const TENCENT_FQKLINE_URL: &str = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get";
 const TENCENT_MKLINE_URL: &str = "https://ifzq.gtimg.cn/appstock/app/kline/mkline";
 const TENCENT_KLINE_LIMIT: u32 = 640;
+const TENCENT_FQKLINE_MAX_PAGES: u32 = 12;
 const TENCENT_QT_URL: &str = "https://qt.gtimg.cn/q=";
 const TENCENT_SEARCH_URL: &str = "https://proxy.finance.qq.com/ifzqgtimg/appstock/code/search";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -486,37 +487,36 @@ fn unix_to_shanghai_date(secs: i64) -> String {
         .unwrap_or_default()
 }
 
-fn tencent_fqkline_date_range(from: i64, to: i64) -> (String, String) {
-    if from >= 0 && to >= from {
-        (unix_to_shanghai_date(from), unix_to_shanghai_date(to))
-    } else if to >= 0 {
-        // TV sometimes sends invalid `from`; anchor a wide window ending at `to`.
-        let approx_from = to.saturating_sub(86400 * 900);
-        (unix_to_shanghai_date(approx_from), unix_to_shanghai_date(to))
-    } else {
-        (String::new(), String::new())
-    }
+fn parse_bar_naive_date(date_str: &str) -> Option<NaiveDate> {
+    let value = date_str.trim();
+    let date_part = value.split('T').next()?.trim();
+    NaiveDate::parse_from_str(date_part, "%Y-%m-%d")
+        .ok()
+        .or_else(|| NaiveDate::parse_from_str(date_part, "%Y%m%d").ok())
 }
 
-fn period_step_secs(period: &str) -> i64 {
+fn bar_oldest_date(bars: &[StockBar]) -> Option<NaiveDate> {
+    bars.iter().filter_map(|b| parse_bar_naive_date(&b.date)).min()
+}
+
+fn fqkline_unit(period: &str) -> Option<&'static str> {
     match period {
-        "1" => 60,
-        "5" => 300,
-        "15" => 900,
-        "30" => 1800,
-        "60" => 3600,
-        "D" | "d" => 86_400,
-        "W" | "w" => 604_800,
-        "M" | "m" => 2_592_000,
-        _ => 86_400,
+        "D" | "d" => Some("day"),
+        "W" | "w" => Some("week"),
+        "M" | "m" => Some("month"),
+        _ => None,
     }
 }
 
-fn bar_list_min_ts(bars: &[StockBar]) -> Option<i64> {
-    bars
-        .iter()
-        .filter_map(|b| parse_bar_timestamp(&b.date))
-        .min()
+fn tencent_fqkline_url(symbol: &str, unit: &str, end_date: Option<&str>) -> String {
+    match end_date.filter(|s| !s.is_empty()) {
+        Some(end) => format!(
+            "{TENCENT_FQKLINE_URL}?param={symbol},{unit},,{end},{TENCENT_KLINE_LIMIT},qfq"
+        ),
+        None => format!(
+            "{TENCENT_FQKLINE_URL}?param={symbol},{unit},,,{TENCENT_KLINE_LIMIT},qfq"
+        ),
+    }
 }
 
 fn merge_bars(into: &mut Vec<StockBar>, batch: Vec<StockBar>) {
@@ -554,30 +554,14 @@ fn tencent_symbol(market: &str, clean_code: &str) -> String {
     format!("{market}{clean_code}")
 }
 
-fn tencent_kline_url(
-    market: &str,
-    clean_code: &str,
-    period: &str,
-    from: i64,
-    to: i64,
-) -> Option<String> {
-    let symbol = tencent_symbol(market, clean_code);
-    if matches!(period, "1" | "5" | "15" | "30" | "60") {
-        Some(format!(
-            "{TENCENT_MKLINE_URL}?param={symbol},m{period},,{TENCENT_KLINE_LIMIT}"
-        ))
-    } else {
-        let unit = match period {
-            "D" | "d" => "day",
-            "W" | "w" => "week",
-            "M" | "m" => "month",
-            _ => return None,
-        };
-        let (start, end) = tencent_fqkline_date_range(from, to);
-        Some(format!(
-            "{TENCENT_FQKLINE_URL}?param={symbol},{unit},{start},{end},{TENCENT_KLINE_LIMIT},qfq"
-        ))
+fn tencent_kline_url(market: &str, clean_code: &str, period: &str) -> Option<String> {
+    if !matches!(period, "1" | "5" | "15" | "30" | "60") {
+        return None;
     }
+    let symbol = tencent_symbol(market, clean_code);
+    Some(format!(
+        "{TENCENT_MKLINE_URL}?param={symbol},m{period},,{TENCENT_KLINE_LIMIT}"
+    ))
 }
 
 fn tencent_data_key(period: &str) -> String {
@@ -931,12 +915,33 @@ async fn find_stock_entry(state: &TradingViewState, tv_symbol: &str) -> StockEnt
     build_stock_entry(clean_code.clone(), clean_code)
 }
 
+async fn fetch_tencent_fqkline_page(
+    state: &TradingViewState,
+    symbol: &str,
+    unit: &str,
+    data_key: &str,
+    end_date: Option<&str>,
+) -> Result<Vec<StockBar>, String> {
+    let url = tencent_fqkline_url(symbol, unit, end_date);
+    debug!("Tencent fqkline request: {}", url);
+
+    let resp = http_get_with_retry(&state.http, &url, "Tencent fqkline").await?;
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Tencent fqkline JSON: {e}"))?;
+
+    let bars = extract_tencent_bars(&json, symbol, data_key);
+    if bars.is_empty() {
+        return Err(format!("Tencent fqkline empty for {symbol} ({data_key})"));
+    }
+    Ok(bars)
+}
+
 async fn fetch_history_bars(
     state: &TradingViewState,
     code: &str,
     period: &str,
-    from: i64,
-    to: i64,
 ) -> Result<Vec<StockBar>, String> {
     let clean_code = clean_code_digits(code);
 
@@ -946,13 +951,13 @@ async fn fetch_history_bars(
 
     let market = tencent_market(&clean_code);
     let symbol = tencent_symbol(market, &clean_code);
-    let url = tencent_kline_url(market, &clean_code, period, from, to)
+    let url = tencent_kline_url(market, &clean_code, period)
         .ok_or_else(|| format!("Unsupported period: {period}"))?;
     let data_key = tencent_data_key(period);
 
-    debug!("Tencent kline request: {}", url);
+    debug!("Tencent mkline request: {}", url);
 
-    let resp = http_get_with_retry(&state.http, &url, "Tencent kline").await?;
+    let resp = http_get_with_retry(&state.http, &url, "Tencent mkline").await?;
 
     let json: serde_json::Value = resp
         .json()
@@ -970,8 +975,8 @@ async fn fetch_history_bars(
     Ok(bars)
 }
 
-/// Tencent fqkline returns at most 640 bars per request (most recent within the date window).
-/// Paginate backward until the requested `from` is covered or no more data.
+/// Paginate fqkline with Tencent's `param=code,day,,,640,qfq` / `,,end,640,qfq` pattern.
+/// Always walks back up to TENCENT_FQKLINE_MAX_PAGES (≈12×640 bars) so scroll-left has depth.
 async fn fetch_history_bars_paginated(
     state: &TradingViewState,
     code: &str,
@@ -980,57 +985,72 @@ async fn fetch_history_bars_paginated(
     to: i64,
 ) -> Result<Vec<StockBar>, String> {
     if !matches!(period, "D" | "W" | "M") {
-        return fetch_history_bars(state, code, period, from, to).await;
+        return fetch_history_bars(state, code, period).await;
     }
 
-    let target_from = from.max(0);
-    let fetch_end = if to >= 0 {
-        to
+    let _ = from;
+
+    let clean_code = clean_code_digits(code);
+    if clean_code.len() != 6 {
+        return Err(format!("Invalid A-share code: {code}"));
+    }
+
+    let unit = fqkline_unit(period).ok_or_else(|| format!("Unsupported period: {period}"))?;
+    let market = tencent_market(&clean_code);
+    let symbol = tencent_symbol(market, &clean_code);
+    let data_key = tencent_data_key(period);
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+
+    // When TV scrolls left, anchor the first page at its `to` date.
+    let mut end_date: Option<String> = if to >= 0 && to < now {
+        Some(unix_to_shanghai_date(to))
     } else {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64
+        None
     };
 
-    let step = period_step_secs(period);
     let mut all_bars: Vec<StockBar> = Vec::new();
-    let mut fetch_to = fetch_end;
 
-    for page in 0..8 {
-        let batch = match fetch_history_bars(state, code, period, target_from, fetch_to).await {
+    for page in 0..TENCENT_FQKLINE_MAX_PAGES {
+        let batch = match fetch_tencent_fqkline_page(
+            state,
+            &symbol,
+            unit,
+            &data_key,
+            end_date.as_deref(),
+        )
+        .await
+        {
             Ok(b) => b,
             Err(e) => {
-                warn!("Tencent kline page {page} failed for {code}: {e}");
+                if page == 0 {
+                    return Err(e);
+                }
+                warn!("Tencent fqkline page {page} for {symbol}: {e}");
                 break;
             }
         };
 
-        if batch.is_empty() {
-            break;
-        }
-
-        let batch_min = bar_list_min_ts(&batch);
+        let oldest = bar_oldest_date(&batch);
         let before = all_bars.len();
         merge_bars(&mut all_bars, batch);
         if all_bars.len() == before {
             break;
         }
 
-        let Some(min_ts) = batch_min else { break };
+        let Some(oldest) = oldest else { break };
 
-        if min_ts <= target_from || page == 7 {
-            break;
-        }
-
-        fetch_to = min_ts.saturating_sub(step);
-        if fetch_to <= target_from {
+        end_date = oldest.pred_opt().map(|d| d.format("%Y-%m-%d").to_string());
+        if end_date.is_none() {
             break;
         }
     }
 
     if all_bars.is_empty() {
-        return Err(format!("Tencent returned empty klines for {code} ({period})"));
+        return Err(format!("Tencent returned empty klines for {symbol} ({data_key})"));
     }
 
     Ok(all_bars)
@@ -1267,13 +1287,17 @@ async fn get_history(
             let Some(parsed) =
                 select_bars_for_history(&bars, query.from, query.to, query.countback)
             else {
+                let next_time = bars
+                    .iter()
+                    .filter_map(|bar| parse_bar_timestamp(&bar.date))
+                    .min();
                 debug!(
-                    "No kline overlap for {} (from={} to={}), returning no_data",
-                    query.symbol, query.from, query.to
+                    "No kline overlap for {} (from={} to={}), next_time={:?}",
+                    query.symbol, query.from, query.to, next_time
                 );
                 return Ok(Json(UdfHistoryResponse::NoData {
                     s: "no_data".to_string(),
-                    next_time: None,
+                    next_time,
                 }));
             };
 
