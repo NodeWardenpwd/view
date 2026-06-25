@@ -4,7 +4,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Tradingview</title>
+    <title></title>
     <link rel="icon" type="image/png" href="https://img.cathiefish.art/tradingview/icon2.jpg">
     <link rel="apple-touch-icon" href="https://img.cathiefish.art/tradingview/icon2.jpg">
     <!-- Config -->
@@ -1349,6 +1349,10 @@
             Object.values(watchlistManager.lists).forEach(list => {
                 list.forEach(item => symbols.add(normalizeSymbolInput(item.symbol).toLowerCase()));
             });
+            const activeSymbol = (activeChartSymbolForTitle || getChartActiveSymbol()).toLowerCase();
+            if (isValidAshareSymbol(activeSymbol)) {
+                symbols.add(normalizeSymbolInput(activeSymbol).toLowerCase());
+            }
             if (symbols.size === 0) return;
 
             try {
@@ -1371,6 +1375,8 @@
                     });
                 });
                 watchlistManager.render();
+                const activeQuote = quotes[normalizeSymbolInput(activeSymbol).toLowerCase()];
+                if (activeQuote) updateChartTabTitleFromQuote(activeQuote);
             } catch (e) {
                 console.warn('Quote poll failed:', e);
             }
@@ -1414,6 +1420,61 @@
             const ticker = normalized.toLowerCase();
             localStorage.setItem(CHART_ACTIVE_SYMBOL_KEY, ticker);
             localStorage.setItem('watchlist_selected', ticker);
+        }
+
+        let activeChartSymbolForTitle = getChartActiveSymbol();
+        let activeChartSymbolName = '';
+
+        function formatChartTabTitle(name, last, change, changePercent) {
+            if (!name) return '';
+            const parts = [name];
+            if (Number.isFinite(last)) {
+                parts.push(last.toFixed(2));
+            }
+            if (Number.isFinite(change) && Number.isFinite(changePercent)) {
+                parts.push(`${change.toFixed(2)}(${changePercent.toFixed(2)}%)`);
+            }
+            return parts.join(' ');
+        }
+
+        function updateChartTabTitleFromQuote(quote) {
+            if (!quote) return;
+            const name = quote.name || activeChartSymbolName || activeChartSymbolForTitle;
+            if (quote.name) activeChartSymbolName = quote.name;
+            document.title = formatChartTabTitle(
+                name,
+                quote.last,
+                quote.change,
+                quote.change_percent
+            );
+        }
+
+        function onActiveChartSymbolChanged(symbol, name) {
+            const normalized = normalizeSymbolInput(symbol).toLowerCase();
+            if (!isValidAshareSymbol(normalized)) return;
+            activeChartSymbolForTitle = normalized;
+            if (name) activeChartSymbolName = name;
+            document.title = name || normalized;
+            pollActiveChartQuote();
+        }
+
+        async function pollActiveChartQuote() {
+            const symbol = activeChartSymbolForTitle || getChartActiveSymbol();
+            if (!isValidAshareSymbol(symbol)) return;
+
+            try {
+                const ticker = normalizeSymbolInput(symbol).toLowerCase();
+                const res = await fetch(
+                    `${getApiBaseUrl()}/quotes?symbols=${encodeURIComponent(ticker)}`,
+                    getDatafeedFetchInit()
+                );
+                if (!res.ok) return;
+                const quotes = await res.json();
+                const quote = quotes[ticker];
+                if (quote) updateChartTabTitleFromQuote(quote);
+            } catch (e) {
+                console.warn('Active symbol quote poll failed:', e);
+            }
         }
 
         class WatchlistManager {
@@ -1544,6 +1605,8 @@
                 const normalized = normalizeSymbolInput(symbol).toLowerCase();
                 this.selectedSymbol = normalized;
                 saveChartActiveSymbol(normalized);
+                const item = this.getCurrentList().find(i => normalizeSymbolInput(i.symbol).toLowerCase() === normalized);
+                onActiveChartSymbolChanged(normalized, item?.name);
                 this.saveToStorage();
                 this.render();
                 if (tvWidgets[selectedChartIndex]) {
@@ -1843,6 +1906,8 @@
                         const ticker = this._normalizeTicker(info.ticker || info.symbol || requested);
                         const displayName = (info.name || info.description || ticker).trim();
 
+                        onActiveChartSymbolChanged(ticker, displayName);
+
                         const reqCode = requested.replace(/\D/g, '').slice(-6);
                         const tickCode = ticker.replace(/\D/g, '').slice(-6);
                         if (reqCode.length === 6 && tickCode.length === 6 && reqCode !== tickCode) {
@@ -1973,9 +2038,13 @@
                 const normalized = symbols.map(s => this._normalizeTicker(s));
                 const path = `/quotes?symbols=${encodeURIComponent(normalized.join(','))}`;
                 this._fetchJson(path).then(data => {
+                    const active = (activeChartSymbolForTitle || getChartActiveSymbol()).toLowerCase();
                     onDataCallback(symbols.map((sym, idx) => {
                         const ticker = normalized[idx];
                         const q = data[ticker];
+                        if (q && ticker === active) {
+                            updateChartTabTitleFromQuote(q);
+                        }
                         if (!q) {
                             return { s: 'error', n: sym };
                         }
@@ -2604,6 +2673,7 @@
         function createWidget(index, customSymbol = null) {
             const symbol = (customSymbol || getChartActiveSymbol()).toLowerCase();
             saveChartActiveSymbol(symbol);
+            onActiveChartSymbolChanged(symbol);
 
             const widget = new TradingView.widget({
                 symbol: symbol,
@@ -2715,6 +2785,7 @@
                             if (ticker && isValidAshareSymbol(ticker)) {
                                 const normalized = normalizeSymbolInput(ticker).toLowerCase();
                                 saveChartActiveSymbol(normalized);
+                                onActiveChartSymbolChanged(normalized, info.name || info.description);
                                 if (watchlistManager) {
                                     watchlistManager.selectedSymbol = normalized;
                                     watchlistManager.saveToStorage();
