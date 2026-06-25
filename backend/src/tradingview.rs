@@ -1097,8 +1097,6 @@ fn remap_timestamp_at(
 
 fn select_bars_for_history(
     bars: &[StockBar],
-    from: i64,
-    to: i64,
     countback: Option<i64>,
 ) -> Vec<(i64, &StockBar)> {
     let mut parsed: Vec<(i64, &StockBar)> = bars
@@ -1112,30 +1110,14 @@ fn select_bars_for_history(
         return parsed;
     }
 
-    // TradingView may send invalid negative timestamps on first load (e.g. year 1941).
-    // Only apply from/to filtering when the range looks sane.
-    let range_valid = from >= 0 && to >= from;
+    // Never apply from/to filtering here — it can collapse to a single bar and break TV.
+    // Always return the latest N bars; timestamp remapping handles the requested window.
+    let min_bars = 2_usize;
+    let requested = countback.map(|c| c.max(min_bars as i64) as usize);
+    let take = requested.unwrap_or(300).max(min_bars).min(parsed.len());
 
-    if range_valid {
-        let filtered: Vec<(i64, &StockBar)> = parsed
-            .iter()
-            .copied()
-            .filter(|(ts, _)| *ts >= from && *ts <= to)
-            .collect();
-        if !filtered.is_empty() {
-            parsed = filtered;
-        }
-    } else {
-        warn!(
-            "Ignoring invalid history range from={from} to={to}, returning latest bars"
-        );
-    }
-
-    if let Some(countback) = countback {
-        let cb = countback.max(1) as usize;
-        if parsed.len() > cb {
-            parsed = parsed.split_off(parsed.len() - cb);
-        }
+    if parsed.len() > take {
+        parsed = parsed.split_off(parsed.len() - take);
     }
 
     parsed
@@ -1170,9 +1152,21 @@ async fn get_history(
 
     match fetch_history_bars(&state, &code, period).await {
         Ok(bars) => {
-            let parsed = select_bars_for_history(&bars, query.from, query.to, query.countback);
+            if bars.is_empty() {
+                return Ok(Json(UdfHistoryResponse::NoData {
+                    s: "no_data".to_string(),
+                    next_time: None,
+                }));
+            }
 
-            if parsed.is_empty() {
+            let parsed = select_bars_for_history(&bars, query.countback);
+
+            if parsed.len() < 2 {
+                warn!(
+                    "Insufficient bars for {} ({}), returning no_data",
+                    query.symbol,
+                    parsed.len()
+                );
                 return Ok(Json(UdfHistoryResponse::NoData {
                     s: "no_data".to_string(),
                     next_time: None,
@@ -1212,6 +1206,21 @@ async fn get_history(
                 v.push(bar.volume);
             }
 
+            let len = t.len();
+            if len < 2
+                || o.len() != len
+                || h.len() != len
+                || l.len() != len
+                || c.len() != len
+                || v.len() != len
+            {
+                warn!("History array length mismatch for {}, returning no_data", query.symbol);
+                return Ok(Json(UdfHistoryResponse::NoData {
+                    s: "no_data".to_string(),
+                    next_time: None,
+                }));
+            }
+
             Ok(Json(UdfHistoryResponse::Ok {
                 s: "ok".to_string(),
                 t,
@@ -1222,10 +1231,13 @@ async fn get_history(
                 v,
             }))
         }
-        Err(e) => Ok(Json(UdfHistoryResponse::Error {
-            s: "error".to_string(),
-            errmsg: e,
-        })),
+        Err(e) => {
+            warn!("History fetch failed for {}: {e}", query.symbol);
+            Ok(Json(UdfHistoryResponse::NoData {
+                s: "no_data".to_string(),
+                next_time: None,
+            }))
+        }
     }
 }
 

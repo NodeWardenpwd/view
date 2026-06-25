@@ -1506,12 +1506,13 @@
             }
 
             selectSymbol(symbol) {
-                this.selectedSymbol = symbol;
+                const normalized = normalizeSymbolInput(symbol);
+                this.selectedSymbol = normalized;
                 this.saveToStorage();
                 this.render();
-                // Only update the currently selected chart
                 if (tvWidgets[selectedChartIndex]) {
-                    tvWidgets[selectedChartIndex].setSymbol(symbol, tvWidgets[selectedChartIndex].activeChart().resolution());
+                    const widget = tvWidgets[selectedChartIndex];
+                    widget.setSymbol(normalized, widget.activeChart().resolution());
                 }
             }
 
@@ -1719,6 +1720,58 @@
                 this.url = String(url).replace(/\/$/, '');
                 this.subscriptions = {};
                 this._pollTimers = {};
+                this._resolveSeq = 0;
+                this._barsRequestSeq = 0;
+                this._activeSymbol = null;
+            }
+
+            _normalizeTicker(raw) {
+                if (!raw) return '';
+                const value = String(raw).trim().toLowerCase();
+                const digits = value.replace(/\D/g, '');
+                const code = digits.length >= 6 ? digits.slice(-6) : digits;
+                if (code.length !== 6) return value;
+                if (value.startsWith('sh') || value.startsWith('sz')) {
+                    return `${value.slice(0, 2)}${code}`;
+                }
+                return code.startsWith('6') ? `sh${code}` : `sz${code}`;
+            }
+
+            _buildSymbolInfo(info, requestedTicker, displayName) {
+                const ticker = this._normalizeTicker(requestedTicker);
+                const name = displayName || ticker;
+                return {
+                    symbol: ticker,
+                    ticker,
+                    name,
+                    description: name,
+                    full_name: info.full_name || ticker,
+                    exchange: info.exchange || (ticker.startsWith('sh') ? 'SSE' : 'SZSE'),
+                    listed_exchange: info.listed_exchange || info.exchange || (ticker.startsWith('sh') ? 'SSE' : 'SZSE'),
+                    type: info.type || 'stock',
+                    session: info.session || '0930-1500',
+                    timezone: info.timezone || 'Asia/Shanghai',
+                    minmov: info.minmov || 1,
+                    pricescale: info.pricescale || 100,
+                    has_intraday: true,
+                    has_daily: true,
+                    has_weekly_and_monthly: true,
+                    supported_resolutions: info.supported_resolutions || ['1', '5', '15', '30', '60', 'D', 'W', 'M'],
+                    data_status: 'streaming',
+                };
+            }
+
+            _onSymbolChanged(nextSymbol) {
+                const normalized = this._normalizeTicker(nextSymbol);
+                if (this._activeSymbol === normalized) return;
+                if (this._activeSymbol) {
+                    Object.keys(window.customIndicatorData || {}).forEach((key) => {
+                        if (key.startsWith(`${this._activeSymbol}_`)) {
+                            delete window.customIndicatorData[key];
+                        }
+                    });
+                }
+                this._activeSymbol = normalized;
             }
 
             _fetchJson(path) {
@@ -1750,63 +1803,94 @@
             }
 
             resolveSymbol(name, onResolve, onError) {
-                this._fetchJson(`/symbols?symbol=${encodeURIComponent(name)}`)
+                const requested = this._normalizeTicker(name);
+                const seq = ++this._resolveSeq;
+                this._onSymbolChanged(requested);
+                this._barsRequestSeq += 1;
+
+                this._fetchJson(`/symbols?symbol=${encodeURIComponent(requested)}`)
                     .then(info => {
-                        const displayName = (info.description || info.name || name).trim();
-                        const ticker = info.ticker || info.symbol || name;
-                        onResolve({
-                            ...info,
-                            ticker,
-                            name: displayName,
-                            description: displayName,
-                            session: info.session || '0930-1500',
-                            timezone: info.timezone || 'Asia/Shanghai',
-                            minmov: info.minmov || 1,
-                            pricescale: info.pricescale || 100,
-                            has_intraday: true,
-                            has_daily: true,
-                            has_weekly_and_monthly: true,
-                            supported_resolutions: info.supported_resolutions || ['1', '5', '15', '30', '60', 'D', 'W', 'M'],
-                            data_status: info.data_status || 'streaming'
-                        });
+                        if (seq !== this._resolveSeq) return;
+
+                        const ticker = this._normalizeTicker(info.ticker || info.symbol || requested);
+                        const displayName = (info.name || info.description || ticker).trim();
+
+                        const reqCode = requested.replace(/\D/g, '').slice(-6);
+                        const tickCode = ticker.replace(/\D/g, '').slice(-6);
+                        if (reqCode.length === 6 && tickCode.length === 6 && reqCode !== tickCode) {
+                            onError(`Symbol mismatch: requested ${requested}, got ${ticker}`);
+                            return;
+                        }
+
+                        onResolve(this._buildSymbolInfo(info, ticker, displayName));
                     })
-                    .catch(e => onError(e.message));
+                    .catch(e => {
+                        if (seq !== this._resolveSeq) return;
+                        onError(e.message);
+                    });
             }
 
             _resolveTicker(symbolInfo) {
-                return symbolInfo.ticker || symbolInfo.symbol;
+                return this._normalizeTicker(symbolInfo.ticker || symbolInfo.symbol);
             }
 
             getBars(symbolInfo, resolution, periodParams, onResult, onError) {
                 const { from, to, countBack } = periodParams;
                 const symbol = this._resolveTicker(symbolInfo);
+                this._onSymbolChanged(symbol);
+                const requestSeq = ++this._barsRequestSeq;
+
                 let path = `/history?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&from=${from}&to=${to}`;
                 if (countBack) path += `&countback=${countBack}`;
 
                 this._fetchJson(path).then(data => {
-                    if (data.s === 'no_data') return onResult([], { noData: true });
-                    if (data.s === 'error') return onError(data.errmsg);
+                    if (requestSeq !== this._barsRequestSeq) return;
+                    if (symbol !== this._resolveTicker(symbolInfo)) return;
+
+                    if (data.s === 'no_data' || !data.t || !Array.isArray(data.t) || data.t.length === 0) {
+                        return onResult([], { noData: true });
+                    }
+                    if (data.s === 'error') return onError(data.errmsg || 'history error');
+                    if (data.s !== 'ok') return onResult([], { noData: true });
+
+                    const len = data.t.length;
+                    if (len < 2 || !data.o || data.o.length !== len || !data.h || data.h.length !== len
+                        || !data.l || data.l.length !== len || !data.c || data.c.length !== len
+                        || !data.v || data.v.length !== len) {
+                        return onResult([], { noData: true });
+                    }
 
                     const bars = [];
                     const key = `${symbol}_${resolution}`;
-                    if (!window.customIndicatorData[key]) window.customIndicatorData[key] = {};
+                    window.customIndicatorData[key] = {};
 
-                    for (let i = 0; i < data.t.length; i++) {
+                    for (let i = 0; i < len; i++) {
                         const time = data.t[i] * 1000;
-                        const bar = { time, open: data.o[i], high: data.h[i], low: data.l[i], close: data.c[i], volume: data.v[i] };
+                        const bar = {
+                            time,
+                            open: data.o[i],
+                            high: data.h[i],
+                            low: data.l[i],
+                            close: data.c[i],
+                            volume: data.v[i],
+                        };
                         bars.push(bar);
                         window.customIndicatorData[key][time] = bar;
                     }
-                    onResult(bars, { noData: bars.length === 0 });
-                }).catch(e => onError(e.message));
+                    onResult(bars, { noData: false });
+                }).catch(e => {
+                    if (requestSeq !== this._barsRequestSeq) return;
+                    onError(e.message);
+                });
             }
 
-            _pollLatestBar(symbol, resolution, onTick) {
+            _pollLatestBar(symbol, resolution, onTick, expectedSeq) {
                 const now = Math.floor(Date.now() / 1000);
                 const lookback = ['D', '1D', 'W', '1W', 'M', '1M'].includes(resolution) ? 86400 * 30 : 86400 * 3;
                 const path = `/history?symbol=${encodeURIComponent(symbol)}&resolution=${encodeURIComponent(resolution)}&from=${now - lookback}&to=${now}&countback=2`;
 
                 this._fetchJson(path).then(data => {
+                    if (expectedSeq !== undefined && expectedSeq !== this._barsRequestSeq) return;
                     if (data.s !== 'ok' || !data.t || data.t.length === 0) return;
                     const i = data.t.length - 1;
                     const bar = {
@@ -1826,12 +1910,18 @@
 
             subscribeBars(symbolInfo, resolution, onTick, listenerGuid) {
                 const symbol = this._resolveTicker(symbolInfo);
-                this.subscriptions[listenerGuid] = { symbol, resolution, onTick };
+                this._onSymbolChanged(symbol);
+                this.subscriptions[listenerGuid] = { symbol, resolution, onTick, seq: this._barsRequestSeq };
 
                 const pollMs = ['D', '1D', 'W', '1W', 'M', '1M'].includes(resolution) ? 30000 : 10000;
-                this._pollLatestBar(symbol, resolution, onTick);
+                const pollSeq = this._barsRequestSeq;
+                this._pollLatestBar(symbol, resolution, onTick, pollSeq);
                 this._pollTimers[listenerGuid] = setInterval(
-                    () => this._pollLatestBar(symbol, resolution, onTick),
+                    () => {
+                        const sub = this.subscriptions[listenerGuid];
+                        if (!sub || sub.symbol !== symbol || sub.seq !== this._barsRequestSeq) return;
+                        this._pollLatestBar(symbol, resolution, onTick, this._barsRequestSeq);
+                    },
                     pollMs
                 );
             }
