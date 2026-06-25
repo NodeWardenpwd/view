@@ -2281,6 +2281,7 @@
                             volume: data.v[i],
                         });
                     }
+                    bars.sort((a, b) => a.time - b.time);
                     mergeBarsIntoStore(key, bars);
                     onResult(bars, { noData: false });
                 }).catch(e => {
@@ -3035,6 +3036,29 @@ return {
             console.log(`[策略回测] ${definition.name} | 屏幕 K 线 ${bars.length} 根 | 模拟累计收益率 ${pnl?.toFixed(2)}%`);
         }
 
+        function normalizeStudyPlotOutput(result, plotDefs) {
+            const plotIds = (plotDefs || []).map(p => p.id);
+            const items = Array.isArray(result) ? result : [result];
+            const values = [];
+            for (let i = 0; i < plotIds.length; i++) {
+                const item = items[i];
+                if (typeof item === 'number') {
+                    values.push(item);
+                } else if (item && typeof item === 'object') {
+                    const id = plotIds[i];
+                    if (id && typeof item[id] === 'number') {
+                        values.push(item[id]);
+                    } else {
+                        const num = Object.values(item).find(v => typeof v === 'number');
+                        values.push(typeof num === 'number' ? num : NaN);
+                    }
+                } else {
+                    values.push(NaN);
+                }
+            }
+            return values;
+        }
+
         function buildPlotStyleDefaults(plot) {
             if (plot.type === 'shapes') {
                 return {
@@ -3069,6 +3093,8 @@ return {
             const onMainChart = resolvePriceStudyFlags(def);
             const displayName = def.description || def.name;
             const studyId = def.id || `${String(def.name).replace(/\s+/g, '')}@tv-basicstudies-1`;
+            const userDefaults = def.defaults || {};
+            const userStyles = def.styles || {};
 
             return {
                 name: def.name,
@@ -3093,13 +3119,17 @@ return {
                     })),
                     plots: def.plots.map(plot => ({
                         id: plot.id,
-                        type: plot.type === 'shapes' ? 'shapes' : (plot.type || 'line'),
+                        type: plot.type === 'shapes' ? 'shapes'
+                            : (userStyles[plot.id]?.type === 'histogram' ? 'histogram' : (plot.type || 'line')),
                     })),
                     defaults: {
-                        styles: Object.fromEntries(def.plots.map(plot => [plot.id, buildPlotStyleDefaults(plot)])),
-                        inputs: Object.fromEntries((def.inputs || []).map(input => [input.id, input.defval])),
+                        styles: userDefaults.styles || Object.fromEntries(def.plots.map(plot => [plot.id, buildPlotStyleDefaults(plot)])),
+                        inputs: userDefaults.inputs || Object.fromEntries((def.inputs || []).map(input => [input.id, input.defval])),
                     },
-                    styles: Object.fromEntries(def.plots.map(plot => [plot.id, { title: plot.title || plot.id }])),
+                    styles: Object.fromEntries(def.plots.map(plot => [
+                        plot.id,
+                        userStyles[plot.id] || { title: plot.title || plot.id },
+                    ])),
                 },
                 constructor: function () {
                     this._pine = null;
@@ -3110,6 +3140,9 @@ return {
                             || window.PineJS
                             || (window.parent && window.parent.PineJS)
                             || null;
+                        const root = getIndicatorDataRoot();
+                        delete root._macd_final_cache;
+                        if (typeof window !== 'undefined') delete window._macd_final_cache;
                         const depth = Math.max(
                             Number(inp.slow) || Number(inp.slowLen) || 26,
                             Number(inp.fast) || Number(inp.fastLen) || 12,
@@ -3163,13 +3196,22 @@ return {
                             close: sym?.close,
                             volume: sym?.volume || 0,
                         };
+                        const closePrice = bar?.close ?? sym?.close ?? NaN;
 
                         const context = {
                             time: resolveBarTime(sym),
                             bar,
                             bars: history,
                             barIndex: idx,
+                            currentIndex: idx,
+                            is_first_bar: idx === 0,
+                            isFirstBar: !!(sym?.isLastBar || idx === bars.length - 1),
                             isLastBar: !!(sym?.isLastBar || idx === bars.length - 1),
+                            close: closePrice,
+                            open: bar?.open ?? sym?.open,
+                            high: bar?.high ?? sym?.high,
+                            low: bar?.low ?? sym?.low,
+                            volume: bar?.volume ?? sym?.volume,
                             PineJS: this._pine || window.PineJS,
                             opens: () => history.map(b => b.open),
                             highs: () => history.map(b => b.high),
@@ -3185,9 +3227,7 @@ return {
                         };
 
                         const result = def.main(context, inp);
-                        const values = Array.isArray(result) ? result : [result];
-                        while (values.length < plotCount) values.push(NaN);
-                        return values.slice(0, plotCount);
+                        return normalizeStudyPlotOutput(result, def.plots);
                     };
                 },
             };

@@ -24,7 +24,6 @@ const SUPPORTED_RESOLUTIONS: &[&str] = &["1", "5", "15", "30", "60", "D", "W", "
 const TENCENT_FQKLINE_URL: &str = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get";
 const TENCENT_MKLINE_URL: &str = "https://ifzq.gtimg.cn/appstock/app/kline/mkline";
 const TENCENT_KLINE_LIMIT: u32 = 640;
-const TENCENT_FQKLINE_MAX_PAGES: u32 = 48;
 const TENCENT_QT_URL: &str = "https://qt.gtimg.cn/q=";
 const TENCENT_SEARCH_URL: &str = "https://proxy.finance.qq.com/ifzqgtimg/appstock/code/search";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -975,13 +974,15 @@ async fn fetch_history_bars(
     Ok(bars)
 }
 
-/// Paginate fqkline backward (`,,end,640`) until TV's `from` is covered.
+/// Paginate fqkline backward only until `countback` bars exist at or before `to`.
+/// Avoids deep pagination to `from` which caused scroll-left gaps (2024 → 2021 jumps).
 async fn fetch_history_bars_paginated(
     state: &TradingViewState,
     code: &str,
     period: &str,
-    from: i64,
+    _from: i64,
     to: i64,
+    countback: Option<i64>,
 ) -> Result<Vec<StockBar>, String> {
     if !matches!(period, "D" | "W" | "M") {
         return fetch_history_bars(state, code, period).await;
@@ -1002,16 +1003,10 @@ async fn fetch_history_bars_paginated(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let target_from_date = if from >= 0 {
-        parse_bar_naive_date(&unix_to_shanghai_date(from))
-    } else if to >= 0 {
-        // TV firstDataRequest may send invalid `from`; walk back from `to`.
-        parse_bar_naive_date(&unix_to_shanghai_date(to.saturating_sub(86400 * 1200)))
-    } else {
-        None
-    };
+    let cb = countback.map(|c| c.max(1) as usize).unwrap_or(300);
+    let need = cb.min(TENCENT_KLINE_LIMIT as usize);
 
-    // Anchor first page at TV's `to` when scrolling left; otherwise fetch latest.
+    // Anchor at TV's `to` when scrolling left; otherwise fetch latest.
     let mut end_date: Option<String> = if to >= 0 && to < now {
         Some(unix_to_shanghai_date(to))
     } else {
@@ -1020,8 +1015,11 @@ async fn fetch_history_bars_paginated(
 
     let mut all_bars: Vec<StockBar> = Vec::new();
     let mut prev_oldest: Option<NaiveDate> = None;
+    let max_pages = ((cb + TENCENT_KLINE_LIMIT as usize - 1) / TENCENT_KLINE_LIMIT as usize)
+        .max(1)
+        .min(4) as u32;
 
-    for page in 0..TENCENT_FQKLINE_MAX_PAGES {
+    for page in 0..max_pages {
         let batch = match fetch_tencent_fqkline_page(
             state,
             &symbol,
@@ -1044,6 +1042,23 @@ async fn fetch_history_bars_paginated(
         let batch_oldest = bar_oldest_date(&batch);
         merge_bars(&mut all_bars, batch);
 
+        let bars_at_or_before_to = if to >= 0 {
+            all_bars
+                .iter()
+                .filter(|bar| {
+                    parse_bar_timestamp(&bar.date)
+                        .map(|ts| ts <= to)
+                        .unwrap_or(false)
+                })
+                .count()
+        } else {
+            all_bars.len()
+        };
+
+        if bars_at_or_before_to >= need {
+            break;
+        }
+
         let Some(oldest) = batch_oldest else { break };
 
         if prev_oldest == Some(oldest) {
@@ -1052,15 +1067,12 @@ async fn fetch_history_bars_paginated(
         }
         prev_oldest = Some(oldest);
 
-        if let Some(target) = target_from_date {
-            if oldest <= target {
-                break;
-            }
+        end_date = oldest.pred_opt().map(|d| d.format("%Y-%m-%d").to_string());
+        if end_date.is_none() {
+            break;
         }
 
-        end_date = Some(oldest.format("%Y-%m-%d").to_string());
-
-        if page + 1 < TENCENT_FQKLINE_MAX_PAGES {
+        if page + 1 < max_pages {
             sleep(Duration::from_millis(200)).await;
         }
     }
@@ -1204,7 +1216,7 @@ async fn search_symbols(
 }
 
 /// Select bars for UDF `/history`.
-/// Honors `countback`: always return up to `countback` bars ending at or before `to`.
+/// UDF contract: return up to `countback` bars ending at or before `to` (continuous, no gaps).
 fn select_bars_for_history(
     bars: &[StockBar],
     from: i64,
@@ -1223,63 +1235,17 @@ fn select_bars_for_history(
     parsed.sort_by_key(|(ts, _)| *ts);
     parsed.dedup_by_key(|(ts, _)| *ts);
 
-    let min_ts = parsed.first().map(|(ts, _)| *ts)?;
-    let max_ts = parsed.last().map(|(ts, _)| *ts)?;
-
-    let cb = countback.map(|c| c.max(1) as usize).unwrap_or(300);
-
-    // Invalid or firstDataRequest-style window: return countback bars ending at `to`.
     if to < 0 {
         return None;
     }
-    if from < 0 || to < from {
-        let mut candidates: Vec<(i64, &StockBar)> = parsed
-            .iter()
-            .copied()
-            .filter(|(ts, _)| *ts <= to)
-            .collect();
-        if candidates.len() > cb {
-            candidates = candidates.split_off(candidates.len() - cb);
-        }
-        return if candidates.is_empty() { None } else { Some(candidates) };
-    }
 
-    // TV scroll-left gap: request entirely before fetched range — signal retry.
-    if to < min_ts {
-        return None;
-    }
-
-    // Request starts before fetched range but overlaps on the right — return what we have.
-    if from < min_ts {
-        let mut candidates: Vec<(i64, &StockBar)> = parsed
-            .iter()
-            .copied()
-            .filter(|(ts, _)| *ts <= to)
-            .collect();
-        if candidates.len() > cb {
-            candidates = candidates.split_off(candidates.len() - cb);
-        }
-        return if candidates.is_empty() { None } else { Some(candidates) };
-    }
-
-    if from > max_ts {
-        return None;
-    }
+    let cb = countback.map(|c| c.max(1) as usize).unwrap_or(300);
 
     let mut candidates: Vec<(i64, &StockBar)> = parsed
         .iter()
         .copied()
-        .filter(|(ts, _)| *ts <= to && *ts >= from)
+        .filter(|(ts, _)| *ts <= to)
         .collect();
-
-    // UDF countback: extend backward when the [from,to] window is too narrow.
-    if candidates.len() < cb {
-        candidates = parsed
-            .iter()
-            .copied()
-            .filter(|(ts, _)| *ts <= to)
-            .collect();
-    }
 
     if candidates.is_empty() {
         return None;
@@ -1289,7 +1255,27 @@ fn select_bars_for_history(
         candidates = candidates.split_off(candidates.len() - cb);
     }
 
-    Some(candidates)
+    // Honour `from` only when it does not create a gap at the right edge near `to`.
+    if from >= 0 && from <= to {
+        let trimmed: Vec<(i64, &StockBar)> = candidates
+            .iter()
+            .copied()
+            .filter(|(ts, _)| *ts >= from)
+            .collect();
+        if !trimmed.is_empty() && trimmed.first().map(|(ts, _)| *ts) <= trimmed.last().map(|(ts, _)| *ts) {
+            let newest = trimmed.last().map(|(ts, _)| *ts)?;
+            let expected_newest = candidates.last().map(|(ts, _)| *ts)?;
+            if newest >= expected_newest.saturating_sub(86400 * 7) {
+                candidates = trimmed;
+            }
+        }
+    }
+
+    if candidates.is_empty() {
+        None
+    } else {
+        Some(candidates)
+    }
 }
 
 async fn get_history(
@@ -1319,7 +1305,15 @@ async fn get_history(
         }));
     }
 
-    match fetch_history_bars_paginated(&state, &code, period, query.from, query.to).await {
+    match fetch_history_bars_paginated(
+        &state,
+        &code,
+        period,
+        query.from,
+        query.to,
+        query.countback,
+    )
+    .await {
         Ok(bars) => {
             if bars.is_empty() {
                 return Ok(Json(UdfHistoryResponse::NoData {
