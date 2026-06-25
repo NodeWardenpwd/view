@@ -1878,7 +1878,7 @@
                     if (data.s !== 'ok') return onResult([], { noData: true });
 
                     const len = data.t.length;
-                    if (len < 2 || !data.o || data.o.length !== len || !data.h || data.h.length !== len
+                    if (len < 1 || !data.o || data.o.length !== len || !data.h || data.h.length !== len
                         || !data.l || data.l.length !== len || !data.c || data.c.length !== len
                         || !data.v || data.v.length !== len) {
                         return onResult([], { noData: true });

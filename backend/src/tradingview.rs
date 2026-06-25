@@ -998,7 +998,14 @@ async fn fetch_history_bars_paginated(
     let mut fetch_to = fetch_end;
 
     for page in 0..8 {
-        let batch = fetch_history_bars(state, code, period, target_from, fetch_to).await?;
+        let batch = match fetch_history_bars(state, code, period, target_from, fetch_to).await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Tencent kline page {page} failed for {code}: {e}");
+                break;
+            }
+        };
+
         if batch.is_empty() {
             break;
         }
@@ -1160,8 +1167,8 @@ async fn search_symbols(
     Ok(Json(results))
 }
 
-/// Select bars whose real timestamps fall in the requested UDF window.
-/// Returns `None` when the range is invalid or does not intersect our fetched data.
+/// Select bars for UDF `/history`.
+/// Honors `countback`: always return up to `countback` bars ending at or before `to`.
 fn select_bars_for_history(
     bars: &[StockBar],
     from: i64,
@@ -1178,6 +1185,7 @@ fn select_bars_for_history(
     }
 
     parsed.sort_by_key(|(ts, _)| *ts);
+    parsed.dedup_by_key(|(ts, _)| *ts);
 
     let min_ts = parsed.first().map(|(ts, _)| *ts)?;
     let max_ts = parsed.last().map(|(ts, _)| *ts)?;
@@ -1186,31 +1194,38 @@ fn select_bars_for_history(
         return None;
     }
 
-    // Request window has no overlap with available klines.
+    // No overlap between TV request and our fetched data.
     if to < min_ts || from > max_ts {
         return None;
     }
 
-    let eff_from = from.max(min_ts);
-    let eff_to = to.min(max_ts);
+    let cb = countback.map(|c| c.max(1) as usize).unwrap_or(300);
 
-    let mut filtered: Vec<(i64, &StockBar)> = parsed
-        .into_iter()
-        .filter(|(ts, _)| *ts >= eff_from && *ts <= eff_to)
+    // Bars at or before `to`, prefer those at or after `from`.
+    let mut candidates: Vec<(i64, &StockBar)> = parsed
+        .iter()
+        .copied()
+        .filter(|(ts, _)| *ts <= to && *ts >= from)
         .collect();
 
-    if filtered.is_empty() {
+    // UDF countback: extend backward when the [from,to] window is too narrow.
+    if candidates.len() < cb {
+        candidates = parsed
+            .iter()
+            .copied()
+            .filter(|(ts, _)| *ts <= to)
+            .collect();
+    }
+
+    if candidates.is_empty() {
         return None;
     }
 
-    if let Some(countback) = countback {
-        let cb = countback.max(1) as usize;
-        if filtered.len() > cb {
-            filtered = filtered.split_off(filtered.len() - cb);
-        }
+    if candidates.len() > cb {
+        candidates = candidates.split_off(candidates.len() - cb);
     }
 
-    Some(filtered)
+    Some(candidates)
 }
 
 async fn get_history(
