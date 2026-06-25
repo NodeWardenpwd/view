@@ -1040,87 +1040,54 @@ async fn search_symbols(
     Ok(Json(results))
 }
 
-fn period_step_secs(period: &str) -> i64 {
-    match period {
-        "1" => 60,
-        "5" => 300,
-        "15" => 900,
-        "30" => 1800,
-        "60" => 3600,
-        "D" | "d" => 86_400,
-        "W" | "w" => 604_800,
-        "M" | "m" => 2_592_000,
-        _ => 86_400,
-    }
-}
-
-fn should_remap_timestamps(from: i64, to: i64, parsed: &[(i64, &StockBar)]) -> bool {
-    if parsed.is_empty() {
-        return false;
-    }
-    if from < 0 || to < 0 || to < from {
-        return true;
-    }
-    !parsed
-        .iter()
-        .any(|(ts, _)| *ts >= from && *ts <= to)
-}
-
-fn remap_timestamp_at(
-    index: usize,
-    count: usize,
-    from: i64,
-    to: i64,
-    period: &str,
-) -> i64 {
-    if count == 0 {
-        return from.max(to);
-    }
-    if count == 1 {
-        return if to >= 0 { to } else { from.max(to) };
-    }
-
-    let step = period_step_secs(period);
-    let last = count - 1;
-
-    // Evenly distribute across a sane [from, to] window (e.g. TV asks for 2010 but data is 2026).
-    if from >= 0 && to >= from {
-        let span = to - from;
-        return from + (index as i64 * span) / last as i64;
-    }
-
-    // Overflow / negative range: anchor last bar at `to`, walk backward by bar period.
-    let anchor = if to != 0 { to } else { from + step * last as i64 };
-    let offset = (last - index) as i64;
-    anchor.saturating_sub(step * offset)
-}
-
+/// Select bars whose real timestamps fall in the requested UDF window.
+/// Returns `None` when the range is invalid or does not intersect our fetched data.
 fn select_bars_for_history(
     bars: &[StockBar],
+    from: i64,
+    to: i64,
     countback: Option<i64>,
-) -> Vec<(i64, &StockBar)> {
+) -> Option<Vec<(i64, &StockBar)>> {
     let mut parsed: Vec<(i64, &StockBar)> = bars
         .iter()
         .filter_map(|bar| parse_bar_timestamp(&bar.date).map(|ts| (ts, bar)))
         .collect();
 
+    if parsed.is_empty() {
+        return None;
+    }
+
     parsed.sort_by_key(|(ts, _)| *ts);
 
-    if parsed.is_empty() {
-        return parsed;
+    let min_ts = parsed.first().map(|(ts, _)| *ts)?;
+    let max_ts = parsed.last().map(|(ts, _)| *ts)?;
+
+    if from < 0 || to < 0 || to < from {
+        return None;
     }
 
-    // Never apply from/to filtering here — it can collapse to a single bar and break TV.
-    // Always return the latest N bars; timestamp remapping handles the requested window.
-    let min_bars = 2_usize;
-    let requested = countback.map(|c| c.max(min_bars as i64) as usize);
-    let take = requested.unwrap_or(300).max(min_bars).min(parsed.len());
-
-    if parsed.len() > take {
-        parsed = parsed.split_off(parsed.len() - take);
+    // Request window has no overlap with available klines (e.g. 2010 vs our 2023–2026 cache).
+    if to < min_ts || from > max_ts {
+        return None;
     }
 
-    parsed
+    let mut filtered: Vec<(i64, &StockBar)> = parsed
+        .into_iter()
+        .filter(|(ts, _)| *ts >= from && *ts <= to)
+        .collect();
+
+    if filtered.is_empty() {
+        return None;
+    }
+
+    if let Some(countback) = countback {
+        let cb = countback.max(1) as usize;
+        if filtered.len() > cb {
+            filtered = filtered.split_off(filtered.len() - cb);
+        }
+    }
+
+    Some(filtered)
 }
 
 async fn get_history(
@@ -1159,30 +1126,18 @@ async fn get_history(
                 }));
             }
 
-            let parsed = select_bars_for_history(&bars, query.countback);
-
-            if parsed.len() < 2 {
-                warn!(
-                    "Insufficient bars for {} ({}), returning no_data",
-                    query.symbol,
-                    parsed.len()
+            let Some(parsed) =
+                select_bars_for_history(&bars, query.from, query.to, query.countback)
+            else {
+                debug!(
+                    "No kline overlap for {} (from={} to={}), returning no_data",
+                    query.symbol, query.from, query.to
                 );
                 return Ok(Json(UdfHistoryResponse::NoData {
                     s: "no_data".to_string(),
                     next_time: None,
                 }));
-            }
-
-            let remap = should_remap_timestamps(query.from, query.to, &parsed);
-            if remap {
-                warn!(
-                    "Remapping {} {} bars into requested range from={} to={}",
-                    parsed.len(),
-                    period,
-                    query.from,
-                    query.to
-                );
-            }
+            };
 
             let mut t = Vec::with_capacity(parsed.len());
             let mut o = Vec::with_capacity(parsed.len());
@@ -1191,13 +1146,7 @@ async fn get_history(
             let mut c = Vec::with_capacity(parsed.len());
             let mut v = Vec::with_capacity(parsed.len());
 
-            let bar_count = parsed.len();
-            for (i, (real_ts, bar)) in parsed.iter().enumerate() {
-                let ts = if remap {
-                    remap_timestamp_at(i, bar_count, query.from, query.to, period)
-                } else {
-                    *real_ts
-                };
+            for (ts, bar) in parsed {
                 t.push(ts);
                 o.push(bar.open);
                 h.push(bar.high);
@@ -1207,14 +1156,13 @@ async fn get_history(
             }
 
             let len = t.len();
-            if len < 2
+            if len == 0
                 || o.len() != len
                 || h.len() != len
                 || l.len() != len
                 || c.len() != len
                 || v.len() != len
             {
-                warn!("History array length mismatch for {}, returning no_data", query.symbol);
                 return Ok(Json(UdfHistoryResponse::NoData {
                     s: "no_data".to_string(),
                     next_time: None,
