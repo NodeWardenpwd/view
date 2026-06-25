@@ -1321,6 +1321,7 @@
         let currentLayout = 'single';
         let selectedChartIndex = 0;  // Currently selected chart index
         let isDarkTheme = true;
+        const UI_THEME_KEY = 'tv_ui_dark_theme';
         let isPanelVisible = true;
         let isResizing = false;
         let isLayoutSelectorOpen = false;
@@ -2199,7 +2200,7 @@
                     }
 
                     const bars = [];
-                    const key = `${symbol}_${resolution}`;
+                    const key = makeBarStoreKey(symbol, resolution);
                     window.customIndicatorData[key] = {};
 
                     for (let i = 0; i < len; i++) {
@@ -2239,7 +2240,7 @@
                         close: data.c[i],
                         volume: data.v[i]
                     };
-                    const key = `${symbol}_${resolution}`;
+                    const key = makeBarStoreKey(symbol, resolution);
                     if (!window.customIndicatorData[key]) window.customIndicatorData[key] = {};
                     window.customIndicatorData[key][bar.time] = bar;
                     onTick(bar);
@@ -2349,7 +2350,7 @@ function sma(values, length) {
 return {
     id: 'UserDualMAStrategy@tv-basicstudies-1',
     name: '双均线交易策略',
-    description: '快线/慢线金叉死叉策略，含 MA 均线与买卖箭头',
+    description: '双均线交易策略',
     shortDescription: '双均线策略',
     isPriceStudy: true,
     inputs: [
@@ -2408,6 +2409,58 @@ return {
     },
 };`;
 
+        const DEFAULT_MACD_SCRIPT = `// MACD 副图指标 — isPriceStudy: false → K 线下方独立副图区域
+function ema(values, length) {
+    if (!values || values.length < length) return NaN;
+    const k = 2 / (length + 1);
+    let prev = values.slice(0, length).reduce((a, b) => a + b, 0) / length;
+    for (let i = length; i < values.length; i++) {
+        prev = values[i] * k + prev * (1 - k);
+    }
+    return prev;
+}
+
+return {
+    id: 'UserMACD@tv-basicstudies-1',
+    name: '自定义 MACD',
+    description: '自定义 MACD',
+    shortDescription: 'MACD',
+    isPriceStudy: false,
+    inputs: [
+        { id: 'fast', name: '快线', type: 'integer', defval: 12, min: 1, max: 200 },
+        { id: 'slow', name: '慢线', type: 'integer', defval: 26, min: 1, max: 500 },
+        { id: 'signal', name: '信号线', type: 'integer', defval: 9, min: 1, max: 200 },
+    ],
+    plots: [
+        { id: 'macd', title: 'MACD', type: 'line', color: '#2196F3' },
+        { id: 'signal', title: 'Signal', type: 'line', color: '#FF9800' },
+        { id: 'hist', title: 'Histogram', type: 'histogram', color: '#26a69a' },
+    ],
+    main(context, inputs) {
+        const fast = Number(inputs.fast) || 12;
+        const slow = Number(inputs.slow) || 26;
+        const sigLen = Number(inputs.signal) || 9;
+        const closes = context.closes();
+        if (closes.length < slow) return [NaN, NaN, NaN];
+
+        const macdSeries = [];
+        for (let i = slow; i <= closes.length; i++) {
+            const slice = closes.slice(0, i);
+            const fastEma = ema(slice, fast);
+            const slowEma = ema(slice, slow);
+            if (Number.isNaN(fastEma) || Number.isNaN(slowEma)) {
+                macdSeries.push(NaN);
+            } else {
+                macdSeries.push(fastEma - slowEma);
+            }
+        }
+        const macdVal = macdSeries[macdSeries.length - 1];
+        const signalVal = ema(macdSeries.filter(v => !Number.isNaN(v)), sigLen);
+        const hist = Number.isNaN(macdVal) || Number.isNaN(signalVal) ? NaN : macdVal - signalVal;
+        return [macdVal, signalVal, hist];
+    },
+};`;
+
         function escapeHtml(text) {
             return String(text)
                 .replace(/&/g, '&amp;')
@@ -2436,34 +2489,156 @@ return {
 
         function seedDefaultUserScriptIfEmpty(store) {
             if (Object.keys(store.scripts).length > 0) return store;
-            const id = 'UserDualMAStrategy@tv-basicstudies-1';
-            store.scripts[id] = {
-                id,
+            const maId = 'UserDualMAStrategy@tv-basicstudies-1';
+            const macdId = 'UserMACD@tv-basicstudies-1';
+            store.scripts[maId] = {
+                id: maId,
                 name: '双均线交易策略',
                 code: DEFAULT_DUAL_MA_STRATEGY_SCRIPT,
                 updatedAt: Date.now(),
             };
-            store.activeId = id;
+            store.scripts[macdId] = {
+                id: macdId,
+                name: '自定义 MACD',
+                code: DEFAULT_MACD_SCRIPT,
+                updatedAt: Date.now() - 1,
+            };
+            store.activeId = maId;
             saveUserScriptsStore(store);
             return store;
         }
 
-        function compileUserScript(code) {
-            if (!code || !String(code).trim()) {
-                throw new Error('脚本内容不能为空');
+        function executeUserScript(code, PineJS) {
+            const src = String(code).trim();
+            if (!src) throw new Error('脚本内容不能为空');
+            try {
+                return new Function('PineJS', src)(PineJS);
+            } catch (e1) {
+                return new Function(src)();
             }
-            const factory = new Function(String(code));
-            const definition = factory();
-            if (!definition || typeof definition !== 'object') {
+        }
+
+        function resolvePriceStudyFlags(def) {
+            if (def.isPriceStudy === false || def.is_price_study === false) return false;
+            if (def.metainfo && def.metainfo.is_price_study === false) return false;
+            if (def.isPriceStudy === true || def.is_price_study === true) return true;
+            if (def.metainfo && def.metainfo.is_price_study === true) return true;
+            return true;
+        }
+
+        function normalizeBarTime(t) {
+            if (t == null || Number.isNaN(t)) return null;
+            return t < 1e12 ? t * 1000 : t;
+        }
+
+        function findBarIndex(bars, symbolTime) {
+            const ms = normalizeBarTime(symbolTime);
+            if (ms == null) return -1;
+            let idx = bars.findIndex(b => b.time === ms);
+            if (idx >= 0) return idx;
+            idx = bars.findIndex(b => b.time === symbolTime);
+            return idx;
+        }
+
+        function getStudyCreateName(indicator) {
+            return indicator.metainfo?.description
+                || indicator.metainfo?.name
+                || indicator.name;
+        }
+
+        function compileUserScript(code, PineJS) {
+            const raw = executeUserScript(code, PineJS);
+            if (!raw || typeof raw !== 'object') {
                 throw new Error('脚本须 return 一个指标/策略定义对象');
             }
-            if (!definition.id || !definition.name || typeof definition.main !== 'function') {
-                throw new Error('定义对象缺少 id、name 或 main 函数');
+            if (raw.metainfo && raw.constructor) {
+                return raw;
             }
-            if (!Array.isArray(definition.plots) || definition.plots.length === 0) {
+            if (!raw.name || typeof raw.main !== 'function') {
+                throw new Error('定义对象缺少 name 或 main 函数');
+            }
+            if (!Array.isArray(raw.plots) || raw.plots.length === 0) {
                 throw new Error('定义对象须包含至少一个 plots 项');
             }
-            return definition;
+            if (!raw.id) raw.id = `${String(raw.name).replace(/\s+/g, '')}@tv-basicstudies-1`;
+            if (!raw.description) raw.description = raw.name;
+            if (!raw.shortDescription) raw.shortDescription = raw.description;
+            return raw;
+        }
+
+        function parseScriptToCustomIndicator(code, PineJS) {
+            const raw = compileUserScript(code, PineJS);
+
+            if (raw.metainfo && raw.constructor) {
+                if (!raw.name) {
+                    raw.name = raw.metainfo.id || raw.metainfo.description || 'CustomStudy';
+                }
+                if (!raw.metainfo.description) {
+                    raw.metainfo.description = raw.metainfo.name || raw.name;
+                }
+                if (!raw.metainfo.id) {
+                    raw.metainfo.id = `${raw.name}@tv-basicstudies-1`;
+                }
+                raw.metainfo.isCustomIndicator = true;
+                raw.metainfo._metainfoVersion = raw.metainfo._metainfoVersion || 52;
+                return raw;
+            }
+
+            return createCustomIndicatorFromDefinition(raw);
+        }
+
+        function loadCustomIndicatorsFromStorage(PineJS) {
+            const indicators = [];
+            const seen = new Set();
+            const store = seedDefaultUserScriptIfEmpty(loadUserScriptsStore());
+
+            Object.values(store.scripts).forEach((entry) => {
+                try {
+                    const indicator = parseScriptToCustomIndicator(entry.code, PineJS);
+                    const key = indicator.metainfo?.id || indicator.name;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    indicators.push(indicator);
+                } catch (e) {
+                    console.error('解析用户指标失败:', entry.name, e);
+                }
+            });
+
+            return indicators;
+        }
+
+        function normalizeIntervalKey(resolution) {
+            const r = String(resolution || 'D').toUpperCase();
+            if (r === '1D') return 'D';
+            if (r === '1W') return 'W';
+            if (r === '1M') return 'M';
+            return r;
+        }
+
+        function makeBarStoreKey(symbol, resolution) {
+            const sym = normalizeSymbolInput(symbol).toLowerCase();
+            return `${sym}_${normalizeIntervalKey(resolution)}`;
+        }
+
+        function getIndicatorBarStore(ctx) {
+            const info = ctx.symbol.info;
+            const sym = info ? (info.ticker || info.name) : 'sh600519';
+            const intv = ctx.symbol.interval || '1D';
+            const key = makeBarStoreKey(sym, intv);
+            const store = (window.parent && window.parent.customIndicatorData) || window.customIndicatorData || {};
+            return { key, store, bars: store[key] || {} };
+        }
+
+        function buildBarsFromStore(store, key) {
+            let raw = store[key] || {};
+            if (Object.keys(raw).length === 0) {
+                const alt = key.replace(/_D$/, '_1D').replace(/_W$/, '_1W').replace(/_M$/, '_1M');
+                if (alt !== key) raw = store[alt] || {};
+            }
+            return Object.keys(raw)
+                .map(Number)
+                .sort((a, b) => a - b)
+                .map(time => ({ time, ...raw[time] }));
         }
 
         function smaFromCloses(closes, length) {
@@ -2513,7 +2688,7 @@ return {
                 const chart = widget.activeChart();
                 const symbol = chart.symbol();
                 const resolution = chart.resolution();
-                const key = `${normalizeSymbolInput(symbol).toLowerCase()}_${resolution}`;
+                const key = makeBarStoreKey(symbol, resolution);
                 const store = window.customIndicatorData[key];
                 if (!store) return null;
                 return Object.keys(store)
@@ -2582,20 +2757,23 @@ return {
         function createCustomIndicatorFromDefinition(definition) {
             const def = definition;
             const plotCount = def.plots.length;
+            const onMainChart = resolvePriceStudyFlags(def);
+            const displayName = def.description || def.name;
+            const studyId = def.id || `${String(def.name).replace(/\s+/g, '')}@tv-basicstudies-1`;
 
             return {
                 name: def.name,
                 metainfo: {
                     _metainfoVersion: 52,
-                    id: def.id,
+                    id: studyId,
                     name: def.name,
-                    description: def.description || def.name,
-                    shortDescription: def.shortDescription || def.name,
+                    description: displayName,
+                    shortDescription: def.shortDescription || displayName,
                     is_hidden_study: false,
-                    is_price_study: def.isPriceStudy !== false,
-                    linkedToSeries: def.isPriceStudy !== false,
+                    is_price_study: onMainChart,
+                    linkedToSeries: onMainChart,
                     isCustomIndicator: true,
-                    format: { type: def.isPriceStudy !== false ? 'price' : 'volume', precision: 2 },
+                    format: { type: onMainChart ? 'price' : 'volume', precision: 2 },
                     inputs: (def.inputs || []).map(input => ({
                         id: input.id,
                         name: input.name,
@@ -2622,15 +2800,15 @@ return {
                     this.main = function (ctx, inp) {
                         const { key, store } = getIndicatorBarStore(ctx);
                         const bars = buildBarsFromStore(store, key);
-                        const currentTime = ctx.symbol.time;
-                        const idx = bars.findIndex(b => b.time === currentTime);
+                        const idx = findBarIndex(bars, ctx.symbol.time);
                         const history = idx >= 0 ? bars.slice(0, idx + 1) : bars;
 
                         const context = {
-                            time: currentTime,
+                            time: normalizeBarTime(ctx.symbol.time),
                             bar: idx >= 0 ? bars[idx] : null,
                             bars: history,
                             isLastBar: idx >= 0 && idx === bars.length - 1,
+                            PineJS: window.PineJS,
                             opens: () => history.map(b => b.open),
                             highs: () => history.map(b => b.high),
                             lows: () => history.map(b => b.low),
@@ -2653,39 +2831,15 @@ return {
             };
         }
 
-        function rebuildUserScriptRegistry() {
+        function rebuildUserScriptRegistry(PineJS) {
             USER_SCRIPT_REGISTRY.length = 0;
-            const store = seedDefaultUserScriptIfEmpty(loadUserScriptsStore());
-            Object.values(store.scripts).forEach((entry) => {
-                try {
-                    const definition = compileUserScript(entry.code);
-                    USER_SCRIPT_REGISTRY.push(createCustomIndicatorFromDefinition(definition));
-                } catch (e) {
-                    console.warn(`Skip invalid script "${entry.name}":`, e.message);
-                }
-            });
-        }
-
-        function getIndicatorBarStore(ctx) {
-            const info = ctx.symbol.info;
-            const sym = info ? (info.ticker || info.name) : 'sh600519';
-            const intv = ctx.symbol.interval || '1D';
-            const key = `${sym}_${intv}`;
-            const store = (window.parent && window.parent.customIndicatorData) || window.customIndicatorData || {};
-            return { key, store, bars: store[key] || {} };
-        }
-
-        function buildBarsFromStore(store, key) {
-            const raw = store[key] || {};
-            return Object.keys(raw)
-                .map(Number)
-                .sort((a, b) => a - b)
-                .map(time => ({ time, ...raw[time] }));
+            loadCustomIndicatorsFromStorage(PineJS || window.PineJS || null)
+                .forEach((indicator) => USER_SCRIPT_REGISTRY.push(indicator));
         }
 
         function getCustomIndicators(PineJS) {
             window.PineJS = PineJS;
-            rebuildUserScriptRegistry();
+            rebuildUserScriptRegistry(PineJS);
             return USER_SCRIPT_REGISTRY.slice();
         }
 
@@ -2771,7 +2925,7 @@ return {
                 monacoEditor.setValue(entry.code);
                 this.refreshSelector();
                 try {
-                    const def = compileUserScript(entry.code);
+                    const def = compileUserScript(entry.code, window.PineJS || null);
                     runStrategyBacktestForDefinition(def);
                 } catch (e) {
                     updateStrategyPnlDisplay(null);
@@ -2795,7 +2949,7 @@ return {
                 this.store.activeId = id;
                 activeScriptId = id;
                 saveUserScriptsStore(this.store);
-                rebuildUserScriptRegistry();
+                rebuildUserScriptRegistry(window.PineJS || null);
                 this.refreshSelector();
                 if (monacoEditor) monacoEditor.setValue(code);
             },
@@ -2804,7 +2958,7 @@ return {
                 const code = this.getCurrentCode();
                 let definition;
                 try {
-                    definition = compileUserScript(code);
+                    definition = compileUserScript(code, window.PineJS || null);
                 } catch (e) {
                     alert(`脚本解析失败：${e.message}`);
                     return;
@@ -2835,7 +2989,7 @@ return {
                 this.store.activeId = id;
                 activeScriptId = id;
                 saveUserScriptsStore(this.store);
-                rebuildUserScriptRegistry();
+                rebuildUserScriptRegistry(window.PineJS || null);
                 this.refreshSelector();
                 alert(`脚本「${name}」已保存`);
             },
@@ -2862,7 +3016,7 @@ return {
 
                 activeScriptId = this.store.activeId;
                 saveUserScriptsStore(this.store);
-                rebuildUserScriptRegistry();
+                rebuildUserScriptRegistry(window.PineJS || null);
                 this.refreshSelector();
 
                 if (activeScriptId) {
@@ -2876,19 +3030,21 @@ return {
 
             async applyToChart() {
                 const code = this.getCurrentCode();
-                let definition;
+                let indicator;
                 try {
-                    definition = compileUserScript(code);
+                    indicator = parseScriptToCustomIndicator(code, window.PineJS || null);
                 } catch (e) {
                     alert(`无法应用：${e.message}`);
                     return;
                 }
 
+                const studyName = getStudyCreateName(indicator);
+                const definition = compileUserScript(code, window.PineJS || null);
+
                 if (activeScriptId) {
-                    definition.id = activeScriptId;
                     this.store.scripts[activeScriptId] = {
                         id: activeScriptId,
-                        name: definition.name,
+                        name: definition.name || studyName,
                         code,
                         updatedAt: Date.now(),
                     };
@@ -2896,26 +3052,11 @@ return {
                     saveUserScriptsStore(this.store);
                 }
 
-                rebuildUserScriptRegistry();
-                pendingApplyStudyName = definition.name;
+                rebuildUserScriptRegistry(window.PineJS || null);
                 runStrategyBacktestForDefinition(definition);
 
-                const widget = tvWidgets[selectedChartIndex];
-                if (!widget || !widget._ready) {
-                    alert('图表尚未就绪，请稍后再试');
-                    return;
-                }
-
-                try {
-                    const studyResult = widget.activeChart().createStudy(definition.name, false, false);
-                    if (studyResult && typeof studyResult.then === 'function') {
-                        await studyResult;
-                    }
-                    pendingApplyStudyName = null;
-                } catch (e) {
-                    console.warn('createStudy failed, reloading widget:', e);
-                    await reloadWidgetForScripts(selectedChartIndex, definition.name);
-                }
+                pendingApplyStudyName = studyName;
+                await reloadWidgetForScripts(selectedChartIndex, studyName);
             },
 
             bindEvents() {
@@ -3022,7 +3163,7 @@ return {
 
             async init() {
                 this.initStore();
-                rebuildUserScriptRegistry();
+                rebuildUserScriptRegistry(null);
                 this.refreshSelector();
                 this.bindEvents();
                 this.initResizer();
@@ -3031,7 +3172,7 @@ return {
                     await this.initMonacoEditor();
                     if (activeScriptId) {
                         try {
-                            runStrategyBacktestForDefinition(compileUserScript(this.getCurrentCode()));
+                            runStrategyBacktestForDefinition(compileUserScript(this.getCurrentCode(), window.PineJS || null));
                         } catch (e) { /* ignore */ }
                     }
                 } catch (e) {
@@ -3074,7 +3215,10 @@ return {
             const ready = await waitReady();
             if (ready && studyName) {
                 try {
-                    await tvWidgets[index].activeChart().createStudy(studyName, false, false);
+                    const result = tvWidgets[index].activeChart().createStudy(studyName, false, false);
+                    if (result && typeof result.then === 'function') {
+                        await result;
+                    }
                 } catch (e) {
                     console.warn('Failed to auto-apply study after reload:', e);
                 }
@@ -3106,15 +3250,30 @@ return {
             }
         }
 
-        function toggleTheme() {
-            isDarkTheme = !isDarkTheme;
+        function initThemePreference() {
+            const saved = localStorage.getItem(UI_THEME_KEY);
+            isDarkTheme = saved !== 'light';
             document.documentElement.classList.toggle('theme-dark', isDarkTheme);
             document.documentElement.classList.toggle('theme-light', !isDarkTheme);
             document.documentElement.dataset.theme = isDarkTheme ? 'dark' : 'light';
-            // Apply theme to all widgets
-            tvWidgets.forEach(widget => {
-                if (widget) widget.changeTheme(isDarkTheme ? 'Dark' : 'Light');
-            });
+        }
+
+        function syncChartTheme(widget) {
+            if (!widget) return;
+            try {
+                widget.changeTheme(isDarkTheme ? 'Dark' : 'Light');
+            } catch (e) {
+                console.warn('syncChartTheme failed:', e);
+            }
+        }
+
+        function toggleTheme() {
+            isDarkTheme = !isDarkTheme;
+            localStorage.setItem(UI_THEME_KEY, isDarkTheme ? 'dark' : 'light');
+            document.documentElement.classList.toggle('theme-dark', isDarkTheme);
+            document.documentElement.classList.toggle('theme-light', !isDarkTheme);
+            document.documentElement.dataset.theme = isDarkTheme ? 'dark' : 'light';
+            tvWidgets.forEach(widget => syncChartTheme(widget));
         }
 
         // ============ Modal Dialog ============
@@ -3584,8 +3743,10 @@ return {
                 save_load_adapter: createSaveLoadAdapter(),
                 load_last_chart: false,
                 auto_save_delay: 5,
-                custom_indicators_getter: (PineJS) => {
-                    return Promise.resolve(getCustomIndicators(PineJS));
+                custom_indicators_getter: function (PineJS) {
+                    window.PineJS = PineJS;
+                    const indicators = loadCustomIndicatorsFromStorage(PineJS);
+                    return Promise.resolve(indicators);
                 },
                 enabled_features: [
                     "create_volume_indicator_by_default",
@@ -3696,12 +3857,19 @@ return {
 
                 widget._ready = true;
 
+                syncChartTheme(widget);
+                setTimeout(() => syncChartTheme(widget), 300);
+                setTimeout(() => syncChartTheme(widget), 1200);
+
                 if (pendingApplyStudyName) {
                     const studyName = pendingApplyStudyName;
                     pendingApplyStudyName = null;
                     setTimeout(() => {
                         try {
-                            widget.activeChart().createStudy(studyName, false, false);
+                            const result = widget.activeChart().createStudy(studyName, false, false);
+                            if (result && typeof result.then === 'function') {
+                                result.catch((e) => console.warn('Auto apply study failed:', e));
+                            }
                         } catch (e) {
                             console.warn('Auto apply study failed:', e);
                         }
@@ -3711,7 +3879,7 @@ return {
                 setTimeout(() => {
                     try {
                         const code = ScriptEditorManager.getCurrentCode();
-                        runStrategyBacktestForDefinition(compileUserScript(code));
+                        runStrategyBacktestForDefinition(compileUserScript(code, window.PineJS || null));
                     } catch (e) { /* ignore */ }
                 }, 1500);
             });
@@ -3872,6 +4040,8 @@ return {
         }
 
         async function init() {
+            initThemePreference();
+
             // Load supported symbols from backend
             await watchlistManager.initFromBackend();
 
