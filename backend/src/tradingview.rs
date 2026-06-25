@@ -5,7 +5,7 @@ use axum::{
     response::{IntoResponse, Json, Response},
     routing::{delete, get, post},
 };
-use chrono::{FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
+use chrono::{DateTime, FixedOffset, NaiveDate, NaiveDateTime, TimeZone};
 use encoding_rs::GBK;
 use futures::StreamExt;
 use log::{debug, error, info, warn};
@@ -23,7 +23,7 @@ const SHANGHAI_OFFSET_SECS: i32 = 8 * 3600;
 const SUPPORTED_RESOLUTIONS: &[&str] = &["1", "5", "15", "30", "60", "D", "W", "M"];
 const TENCENT_FQKLINE_URL: &str = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get";
 const TENCENT_MKLINE_URL: &str = "https://ifzq.gtimg.cn/appstock/app/kline/mkline";
-const TENCENT_KLINE_LIMIT: u32 = 1000;
+const TENCENT_KLINE_LIMIT: u32 = 640;
 const TENCENT_QT_URL: &str = "https://qt.gtimg.cn/q=";
 const TENCENT_SEARCH_URL: &str = "https://proxy.finance.qq.com/ifzqgtimg/appstock/code/search";
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
@@ -440,40 +440,58 @@ fn build_stock_entry(code: String, name: String) -> StockEntry {
 
 fn parse_bar_timestamp(date_str: &str) -> Option<i64> {
     let value = date_str.trim();
-    let shanghai = FixedOffset::east_opt(SHANGHAI_OFFSET_SECS)?;
 
-    if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M") {
-        return shanghai
-            .from_local_datetime(&dt)
-            .single()
-            .map(|dt| dt.timestamp());
-    }
-
-    let date_part = value.split('T').next()?.trim();
-
-    if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
-        return shanghai
-            .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
-            .single()
-            .map(|dt| dt.timestamp());
-    }
-
-    if date_part.len() == 8 && date_part.chars().all(|c| c.is_ascii_digit()) {
-        if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y%m%d") {
+    // Intraday minute bars: YYYYMMDDHHMM (exchange local time)
+    if value.len() == 12 && value.chars().all(|c| c.is_ascii_digit()) {
+        let shanghai = FixedOffset::east_opt(SHANGHAI_OFFSET_SECS)?;
+        if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y%m%d%H%M") {
             return shanghai
-                .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
+                .from_local_datetime(&dt)
                 .single()
                 .map(|dt| dt.timestamp());
         }
     }
 
-    if value.len() == 12 && value.chars().all(|c| c.is_ascii_digit()) {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y%m%d%H%M") {
-            return shanghai.from_local_datetime(&dt).single().map(|dt| dt.timestamp());
+    // Intraday: YYYY-MM-DD HH:MM (exchange local time)
+    if value.contains(':') {
+        let shanghai = FixedOffset::east_opt(SHANGHAI_OFFSET_SECS)?;
+        if let Ok(dt) = NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M") {
+            return shanghai
+                .from_local_datetime(&dt)
+                .single()
+                .map(|dt| dt.timestamp());
         }
     }
 
-    None
+    // Daily / weekly / monthly calendar dates.
+    // TradingView UDF expects D/W/M bar time at 00:00 UTC of the trading date.
+    let date_part = value.split('T').next()?.trim();
+    let date = if let Ok(d) = NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
+        d
+    } else if date_part.len() == 8 && date_part.chars().all(|c| c.is_ascii_digit()) {
+        NaiveDate::parse_from_str(date_part, "%Y%m%d").ok()?
+    } else {
+        return None;
+    };
+
+    date.and_hms_opt(0, 0, 0).map(|dt| dt.and_utc().timestamp())
+}
+
+fn unix_to_shanghai_date(secs: i64) -> String {
+    let Some(shanghai) = FixedOffset::east_opt(SHANGHAI_OFFSET_SECS) else {
+        return String::new();
+    };
+    DateTime::from_timestamp(secs, 0)
+        .map(|dt| dt.with_timezone(&shanghai).format("%Y-%m-%d").to_string())
+        .unwrap_or_default()
+}
+
+fn tencent_fqkline_date_range(from: i64, to: i64) -> (String, String) {
+    if from >= 0 && to >= from {
+        (unix_to_shanghai_date(from), unix_to_shanghai_date(to))
+    } else {
+        (String::new(), String::new())
+    }
 }
 
 fn normalize_resolution(resolution: &str) -> Option<&'static str> {
@@ -502,7 +520,13 @@ fn tencent_symbol(market: &str, clean_code: &str) -> String {
     format!("{market}{clean_code}")
 }
 
-fn tencent_kline_url(market: &str, clean_code: &str, period: &str) -> Option<String> {
+fn tencent_kline_url(
+    market: &str,
+    clean_code: &str,
+    period: &str,
+    from: i64,
+    to: i64,
+) -> Option<String> {
     let symbol = tencent_symbol(market, clean_code);
     if matches!(period, "1" | "5" | "15" | "30" | "60") {
         Some(format!(
@@ -515,8 +539,9 @@ fn tencent_kline_url(market: &str, clean_code: &str, period: &str) -> Option<Str
             "M" | "m" => "month",
             _ => return None,
         };
+        let (start, end) = tencent_fqkline_date_range(from, to);
         Some(format!(
-            "{TENCENT_FQKLINE_URL}?param={symbol},{unit},,,{TENCENT_KLINE_LIMIT},qfq"
+            "{TENCENT_FQKLINE_URL}?param={symbol},{unit},{start},{end},{TENCENT_KLINE_LIMIT},qfq"
         ))
     }
 }
@@ -876,6 +901,8 @@ async fn fetch_history_bars(
     state: &TradingViewState,
     code: &str,
     period: &str,
+    from: i64,
+    to: i64,
 ) -> Result<Vec<StockBar>, String> {
     let clean_code = clean_code_digits(code);
 
@@ -885,7 +912,7 @@ async fn fetch_history_bars(
 
     let market = tencent_market(&clean_code);
     let symbol = tencent_symbol(market, &clean_code);
-    let url = tencent_kline_url(market, &clean_code, period)
+    let url = tencent_kline_url(market, &clean_code, period, from, to)
         .ok_or_else(|| format!("Unsupported period: {period}"))?;
     let data_key = tencent_data_key(period);
 
@@ -1117,7 +1144,7 @@ async fn get_history(
         }));
     }
 
-    match fetch_history_bars(&state, &code, period).await {
+    match fetch_history_bars(&state, &code, period, query.from, query.to).await {
         Ok(bars) => {
             if bars.is_empty() {
                 return Ok(Json(UdfHistoryResponse::NoData {
