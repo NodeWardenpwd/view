@@ -508,17 +508,15 @@ fn fqkline_unit(period: &str) -> Option<&'static str> {
     }
 }
 
-fn tencent_fqkline_url(
-    symbol: &str,
-    unit: &str,
-    start: Option<&str>,
-    end: Option<&str>,
-) -> String {
-    let start = start.unwrap_or("");
-    let end = end.unwrap_or("");
-    format!(
-        "{TENCENT_FQKLINE_URL}?param={symbol},{unit},{start},{end},{TENCENT_KLINE_LIMIT},qfq"
-    )
+fn tencent_fqkline_url(symbol: &str, unit: &str, end_date: Option<&str>) -> String {
+    match end_date.filter(|s| !s.is_empty()) {
+        Some(end) => format!(
+            "{TENCENT_FQKLINE_URL}?param={symbol},{unit},,{end},{TENCENT_KLINE_LIMIT},qfq"
+        ),
+        None => format!(
+            "{TENCENT_FQKLINE_URL}?param={symbol},{unit},,,{TENCENT_KLINE_LIMIT},qfq"
+        ),
+    }
 }
 
 fn merge_bars(into: &mut Vec<StockBar>, batch: Vec<StockBar>) {
@@ -922,10 +920,9 @@ async fn fetch_tencent_fqkline_page(
     symbol: &str,
     unit: &str,
     data_key: &str,
-    start: Option<&str>,
-    end: Option<&str>,
+    end_date: Option<&str>,
 ) -> Result<Vec<StockBar>, String> {
-    let url = tencent_fqkline_url(symbol, unit, start, end);
+    let url = tencent_fqkline_url(symbol, unit, end_date);
     debug!("Tencent fqkline request: {}", url);
 
     let resp = http_get_with_retry(&state.http, &url, "Tencent fqkline").await?;
@@ -978,7 +975,7 @@ async fn fetch_history_bars(
     Ok(bars)
 }
 
-/// Paginate fqkline backward until TV's `from` is covered or pages exhausted.
+/// Paginate fqkline backward (`,,end,640`) until TV's `from` is covered.
 async fn fetch_history_bars_paginated(
     state: &TradingViewState,
     code: &str,
@@ -1005,28 +1002,17 @@ async fn fetch_history_bars_paginated(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let start_date = if from >= 0 {
-        unix_to_shanghai_date(from)
-    } else {
-        String::new()
-    };
-
     let target_from_date = if from >= 0 {
-        parse_bar_naive_date(&start_date)
+        parse_bar_naive_date(&unix_to_shanghai_date(from))
     } else {
         None
     };
 
-    let mut end_date: Option<String> = if to >= 0 && to <= now {
+    // Anchor first page at TV's `to` when scrolling left; otherwise fetch latest.
+    let mut end_date: Option<String> = if to >= 0 && to < now {
         Some(unix_to_shanghai_date(to))
     } else {
         None
-    };
-
-    let start_ref = if start_date.is_empty() {
-        None
-    } else {
-        Some(start_date.as_str())
     };
 
     let mut all_bars: Vec<StockBar> = Vec::new();
@@ -1038,7 +1024,6 @@ async fn fetch_history_bars_paginated(
             &symbol,
             unit,
             &data_key,
-            start_ref,
             end_date.as_deref(),
         )
         .await
@@ -1250,7 +1235,7 @@ fn select_bars_for_history(
         return None;
     }
 
-    let cb = countback.map(|c| c.max(1) as usize).unwrap_or(640);
+    let cb = countback.map(|c| c.max(1) as usize).unwrap_or(300);
 
     let mut candidates: Vec<(i64, &StockBar)> = parsed
         .iter()
@@ -1258,7 +1243,8 @@ fn select_bars_for_history(
         .filter(|(ts, _)| *ts <= to && *ts >= from)
         .collect();
 
-    if candidates.is_empty() {
+    // UDF countback: extend backward when the [from,to] window is too narrow.
+    if candidates.len() < cb {
         candidates = parsed
             .iter()
             .copied()
